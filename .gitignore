@@ -1,0 +1,23 @@
+# General
+.DS_Store
+.idea/
+.vscode/
+
+# Python / MLServer
+MLServer/venv/
+MLServer/__pycache__/
+*.pyc
+
+# Node / Visualizer
+Visualizer/node_modules/
+Visualizer/dist/
+Visualizer/.env
+
+# Unity / MadcampWeek4 (Assuming standard Unity ignores)
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
