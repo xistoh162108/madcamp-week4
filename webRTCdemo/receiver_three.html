@@ -1,0 +1,413 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>WebRTC IMU Receiver + Three.js</title>
+    <style>
+      body {
+        margin: 0;
+        font-family:
+          system-ui,
+          -apple-system,
+          sans-serif;
+      }
+      #ui {
+        position: fixed;
+        left: 12px;
+        top: 12px;
+        z-index: 10;
+        background: rgba(255, 255, 255, 0.92);
+        padding: 10px;
+        border-radius: 10px;
+        width: 420px;
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+      }
+      #ui input {
+        width: 100%;
+        padding: 6px 8px;
+        box-sizing: border-box;
+      }
+      textarea {
+        width: 100%;
+        height: 90px;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin: 6px 0;
+      }
+      button {
+        padding: 6px 10px;
+      }
+      #stats {
+        font-size: 12px;
+        white-space: pre;
+        background: #f6f6f6;
+        padding: 8px;
+        border-radius: 8px;
+      }
+      canvas {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="ui">
+      <div class="row">
+        <input id="roomId" value="imu" />
+      </div>
+      <div class="row">
+        <button id="btnStart">Start</button>
+        <button id="btnCalibrate">Zero (1-shot)</button>
+      </div>
+
+      <div id="stats">waiting...</div>
+    </div>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+        }
+      }
+    </script>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { GLTFLoader } from "https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+
+      // ---------- Three.js scene ----------
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.body.appendChild(renderer.domElement);
+
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(
+        60,
+        window.innerWidth / window.innerHeight,
+        0.01,
+        100,
+      );
+      camera.position.set(0, 1.2, 3);
+
+      scene.add(new THREE.HemisphereLight(undefined, undefined, 1.0));
+      const dir = new THREE.DirectionalLight(undefined, 1.0);
+      dir.position.set(3, 4, 2);
+      scene.add(dir);
+
+      const grid = new THREE.GridHelper(6, 12);
+      scene.add(grid);
+      const axes = new THREE.AxesHelper(1.2);
+      scene.add(axes);
+
+      // Placeholder cylinder (axis = Y)
+      const cyl = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.2, 0.2, 1.2, 24),
+        new THREE.MeshStandardMaterial(),
+      );
+      cyl.position.set(0, 0.6, 0);
+      scene.add(cyl);
+      let poseObject = cyl;
+
+      // Load lightsaber model
+      const loader = new GLTFLoader();
+      loader.load(
+        "./lightsaber1.glb",
+        (gltf) => {
+          const model = gltf.scene;
+          model.position.set(0, 0.6, 0);
+          model.scale.set(1, 1, 1);
+          scene.add(model);
+          poseObject = model;
+          cyl.visible = false;
+        },
+        undefined,
+        (err) => {
+          console.error("Failed to load lightsaber model", err);
+        },
+      );
+
+      window.addEventListener("resize", () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      function animate() {
+        renderer.render(scene, camera);
+        requestAnimationFrame(animate);
+      }
+      animate();
+
+      // ---------- WebRTC / UI ----------
+      const offerOut = null;
+      const answerIn = null;
+      const iceOut = null;
+      const iceIn = null;
+      const statsEl = document.getElementById("stats");
+      const roomInput = document.getElementById("roomId");
+      const btnCalibrate = document.getElementById("btnCalibrate");
+
+      let pc = null;
+      let dc = null;
+      let ws = null;
+      let wsState = "disconnected";
+      let lastOfferSdp = "";
+      const signalingUrl = "ws://3.37.140.87:8080";
+      let roomId = "imu";
+      const clientId =
+        (crypto && crypto.randomUUID && crypto.randomUUID()) ||
+        Math.random().toString(36).slice(2);
+      let localIceLines = [];
+
+      // ---------- AR pose packet parsing (40 bytes) ----------
+      // Layout:
+      // u32 seq (LE) @0
+      // f64 t (LE)  @4
+      // f32 px,py,pz (LE) @12
+      // f32 qx,qy,qz,qw (LE) @24
+      let lastSeq = 0;
+      let lastT = 0;
+      let lastPos = [0, 0, 0];
+      let lastQuat = [0, 0, 0, 1];
+      let lastRxHz = 0;
+      const basePos = { x: 0, y: 0, z: 0 };
+      const posScale = 1.0;
+
+      const modelCorrection = new THREE.Quaternion().setFromEuler(
+        new THREE.Euler(0, -Math.PI / 2, 0),
+      );
+      let zeroPos = { x: 0, y: 0, z: 0 };
+      let lastSample = null;
+
+      let rxCount = 0;
+      let rxWindowStart = performance.now();
+
+      function parse40(buf) {
+        const dv = new DataView(buf);
+        const seq = dv.getUint32(0, true);
+        const t = dv.getFloat64(4, true);
+
+        const px = dv.getFloat32(12, true);
+        const py = dv.getFloat32(16, true);
+        const pz = dv.getFloat32(20, true);
+
+        const qx = dv.getFloat32(24, true);
+        const qy = dv.getFloat32(28, true);
+        const qz = dv.getFloat32(32, true);
+        const qw = dv.getFloat32(36, true);
+
+        return { seq, t, px, py, pz, qx, qy, qz, qw };
+      }
+
+      function updateStats() {
+        statsEl.textContent = `pc: ${pc ? pc.connectionState : "none"} / ice: ${pc ? pc.iceConnectionState : "none"}
+          dc: ${dc ? dc.readyState : "none"}
+          ws: ${wsState}
+          rxHz: ${lastRxHz.toFixed(1)}
+          seq: ${lastSeq}
+          t: ${lastT.toFixed(3)}
+          pos(xyz):  ${lastPos.map((v) => v.toFixed(3)).join(", ")}
+          quat(xyzw): ${lastQuat.map((v) => v.toFixed(3)).join(", ")}`;
+      }
+      setInterval(updateStats, 200);
+
+      function connectSignaling() {
+        if (
+          ws &&
+          (ws.readyState === WebSocket.OPEN ||
+            ws.readyState === WebSocket.CONNECTING)
+        ) {
+          return;
+        }
+        ws = new WebSocket(signalingUrl);
+        wsState = "connecting";
+        updateStats();
+
+        ws.onopen = () => {
+          wsState = "open";
+          updateStats();
+          sendSignal({ type: "join", room: roomId || "imu" });
+          if (lastOfferSdp) {
+            sendSignal({ type: "offer", sdp: lastOfferSdp });
+          } else if (pc) {
+            createOffer();
+          }
+        };
+
+        ws.onclose = () => {
+          wsState = "closed";
+          updateStats();
+        };
+
+        ws.onerror = () => {
+          wsState = "error";
+          updateStats();
+        };
+
+        ws.onmessage = async (evt) => {
+          let msg = null;
+          try {
+            msg = JSON.parse(evt.data);
+          } catch {
+            return;
+          }
+          if (msg && msg.sender && msg.sender === clientId) return;
+          if (!pc) return;
+
+          if (msg.type === "answer" && msg.sdp) {
+            await setRemoteAnswerSdp(msg.sdp);
+            return;
+          }
+          if (msg.type === "ready") {
+            if (pc) createOffer();
+            return;
+          }
+          if (msg.type === "ice" && msg.candidate) {
+            try {
+              await pc.addIceCandidate(msg.candidate);
+              updateStats();
+            } catch {}
+            return;
+          }
+        };
+      }
+
+      function sendSignal(payload) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        ws.send(JSON.stringify({ sender: clientId, ...payload }));
+      }
+
+      async function start() {
+        roomId = (roomInput && roomInput.value.trim()) || "imu";
+        localIceLines = [];
+        if (iceOut) iceOut.value = "";
+        if (offerOut) offerOut.value = "";
+        statsEl.textContent = "starting...";
+        rxCount = 0;
+        rxWindowStart = performance.now();
+
+        pc = new RTCPeerConnection({
+          iceServers: [
+            { urls: "stun:3.37.140.87:3478" },
+            {
+              urls: [
+                "turn:3.37.140.87:3478?transport=udp",
+                "turn:3.37.140.87:3478?transport=tcp",
+              ],
+              username: "imuuser",
+              credential: "imupass",
+            },
+          ],
+        });
+
+        pc.onicecandidate = (e) => {
+          if (!e.candidate) return;
+          const obj = {
+            candidate: e.candidate.candidate,
+            sdpMLineIndex: e.candidate.sdpMLineIndex,
+            sdpMid: e.candidate.sdpMid,
+          };
+          localIceLines.push(JSON.stringify(obj));
+          if (iceOut) iceOut.value = localIceLines.join("\n");
+          sendSignal({ type: "ice", candidate: obj });
+        };
+
+        pc.oniceconnectionstatechange = () => updateStats();
+        pc.onconnectionstatechange = () => updateStats();
+
+        // Offerer creates DataChannel
+        dc = pc.createDataChannel("imu", { ordered: true, maxRetransmits: 0 });
+        dc.binaryType = "arraybuffer";
+
+        dc.onopen = () => updateStats();
+        dc.onclose = () => updateStats();
+
+        dc.onmessage = async (e) => {
+          const buf =
+            e.data instanceof ArrayBuffer ? e.data : await e.data.arrayBuffer();
+          if (buf.byteLength !== 40) return;
+
+          const p = parse40(buf);
+
+          lastSeq = p.seq;
+          lastT = p.t;
+          lastPos = [p.px, p.py, p.pz];
+          lastQuat = [p.qx, p.qy, p.qz, p.qw];
+
+          // rx Hz 계산
+          rxCount++;
+          const now = performance.now();
+          const dt = now - rxWindowStart;
+          if (dt >= 500) {
+            lastRxHz = (rxCount * 1000) / dt;
+            rxCount = 0;
+            rxWindowStart = now;
+          }
+
+          // ✅ 회전/위치 적용 (ARKit -> Three.js)
+          // ARKit: right-handed, +Z forward. Three.js: right-handed, camera looks -Z.
+          const px = p.px;
+          const py = p.py;
+          const pz = p.pz;
+          const qx = p.qx;
+          const qy = p.qy;
+          const qz = p.qz;
+          const qw = p.qw;
+          lastSample = { px, py, pz, qx, qy, qz, qw };
+
+          poseObject.position.set(
+            basePos.x + (px - zeroPos.x) * posScale,
+            basePos.y + (py - zeroPos.y) * posScale,
+            basePos.z + (pz - zeroPos.z) * posScale,
+          );
+          const deviceQuat = new THREE.Quaternion(qx, qy, qz, qw);
+          poseObject.quaternion.copy(deviceQuat).multiply(modelCorrection);
+        };
+
+        connectSignaling();
+        updateStats();
+      }
+
+      async function createOffer() {
+        if (!pc) return;
+        connectSignaling();
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        lastOfferSdp = pc.localDescription.sdp;
+        if (offerOut) offerOut.value = lastOfferSdp;
+        sendSignal({ type: "offer", sdp: lastOfferSdp });
+        updateStats();
+      }
+
+      async function setRemoteAnswerSdp(rawSdp) {
+        if (!pc || !rawSdp) return;
+        let sdp = rawSdp.trim();
+        // Normalize CRLF and strip unsupported line for Chrome parsing.
+        sdp = sdp
+          .replace(/\r\n/g, "\n")
+          .replace(/\n/g, "\r\n")
+          .replace(/^a=max-message-size:.*(?:\r\n|\r|\n)?/gm, "")
+          .replace(/^a=setup:actpass\r\n?$/gm, "a=setup:active\r\n");
+        await pc.setRemoteDescription({ type: "answer", sdp });
+        updateStats();
+      }
+
+      document.getElementById("btnStart").onclick = start;
+      btnCalibrate.onclick = () => {
+        if (!lastSample) return;
+        zeroPos = {
+          x: lastSample.px,
+          y: lastSample.py,
+          z: lastSample.pz,
+        };
+      };
+      window.addEventListener("beforeunload", () => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.close(1000, "page unload");
+        }
+      });
+    </script>
+  </body>
+</html>
