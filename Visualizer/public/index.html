@@ -109,7 +109,11 @@
 
     <div id="info">
         <h3 style="margin: 0 0 10px 0;">Madcamp Week 4</h3>
-        <div id="status">Waiting for data...</div>
+        <div class="control-group" style="margin-top: 10px; border-top: 1px solid #444; padding-top: 10px;">
+            <label>Data Recording</label>
+            <button onclick="startRecording()" style="background: #880000; border-color: #ff5555; color: white;">Record 5s</button>
+        </div>
+        <div class="status" id="status-text">State: Idle</div>
         <div id="height-status" style="color: #aaaaaa; margin-top: 5px;">Height: 1.70m (Default)</div>
         <div id="latency">UDP Latency: -</div>
         <div id="ml-latency" style="color: cyan; font-weight: bold;">ML Inference: -</div>
@@ -143,6 +147,17 @@
         <button onclick="copySnapshot()" style="border-color: #00ffff; color: #00ffff;">Copy Snapshot</button>
         <button onclick="startCalibration()" style="background: #000088; border-color: #5555ff; color: white;">Calibrate Height (5s)</button>
         <button onclick="logToConsole()" style="background: #004400;">Log to Console</button>
+        <div class="control-group" style="margin-top: 10px; border-top: 1px solid #444; padding-top: 10px;">
+            <label>Data Recording</label>
+            <button onclick="startRecording()" style="background: #880000; border-color: #ff5555; color: white;">Record 5s</button>
+        </div>
+        <div class="control-group" style="margin-top: 10px; border-top: 1px solid #444; padding-top: 10px;">
+            <label>Manual Height (m)</label>
+            <div style="display: flex; gap: 5px;">
+                <input type="number" id="manual-height" value="1.70" step="0.01" style="width: 70px; padding: 5px; border-radius: 4px; border: none;">
+                <button onclick="setManualHeight()" style="padding: 5px 10px; font-size: 12px;">Set</button>
+            </div>
+        </div>
     </div>
 
     <!-- Libraries -->
@@ -598,6 +613,20 @@
             };
             
             inspectorContent.innerText = JSON.stringify(summary, null, 2);
+        }
+        async function startRecording() {
+            try {
+                const res = await fetch(`${ML_SERVER_URL}/record/start`, { method: 'POST' });
+                const data = await res.json();
+                document.getElementById('status-text').innerText = "State: Recording...";
+                // Reset text after 5s
+                setTimeout(() => {
+                    document.getElementById('status-text').innerText = "State: Saved (Server)";
+                }, 5000);
+            } catch (e) {
+                console.error(e);
+                alert("Failed to start recording");
+            }
         }
     </script>
 </body>
