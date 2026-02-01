@@ -1,0 +1,234 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>WebRTC Viewer (Canvas Broadcast)</title>
+    <style>
+      body {
+        margin: 0;
+        font-family:
+          system-ui,
+          -apple-system,
+          sans-serif;
+        background: #000;
+        color: #fff;
+      }
+      #ui {
+        position: fixed;
+        left: 12px;
+        top: 12px;
+        z-index: 10;
+        background: rgba(0, 0, 0, 0.65);
+        padding: 10px;
+        border-radius: 10px;
+        width: 260px;
+      }
+      #ui input {
+        width: 100%;
+        padding: 6px 8px;
+        box-sizing: border-box;
+      }
+      button {
+        padding: 6px 10px;
+        margin-top: 8px;
+        width: 100%;
+      }
+      #status {
+        font-size: 12px;
+        white-space: pre;
+        margin-top: 8px;
+      }
+      canvas {
+        position: fixed;
+        inset: 0;
+        width: 100vw;
+        height: 100vh;
+        background: #000;
+        z-index: 0;
+      }
+      video {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="ui">
+      <input id="roomId" value="imu" />
+      <button id="btnJoin">Join Broadcast</button>
+      <div id="status">idle</div>
+    </div>
+
+    <canvas id="canvas"></canvas>
+    <video id="video" autoplay playsinline muted></video>
+
+    <script>
+      const roomInput = document.getElementById("roomId");
+      const btnJoin = document.getElementById("btnJoin");
+      const statusEl = document.getElementById("status");
+      const videoEl = document.getElementById("video");
+      const canvasEl = document.getElementById("canvas");
+      const ctx = canvasEl.getContext("2d");
+      statusEl.textContent = "js loaded";
+      if (!ctx) {
+        statusEl.textContent = "canvas ctx failed";
+        throw new Error("canvas context failed");
+      }
+
+      const signalingUrl = "ws://3.37.140.87:8080";
+      const clientId =
+        (crypto && crypto.randomUUID && crypto.randomUUID()) ||
+        Math.random().toString(36).slice(2);
+
+      let ws = null;
+      let wsState = "disconnected";
+      let pc = null;
+      let roomId = "imu";
+      let broadcasterId = null;
+
+      function updateStatus(extra) {
+        statusEl.textContent = `ws: ${wsState}\npc: ${pc ? pc.connectionState : "none"}`;
+        if (extra) {
+          statusEl.textContent += `\n${extra}`;
+        }
+      }
+
+      function resizeCanvas() {
+        canvasEl.width = window.innerWidth;
+        canvasEl.height = window.innerHeight;
+      }
+      window.addEventListener("resize", resizeCanvas);
+      resizeCanvas();
+
+      function drawLoop() {
+        if (videoEl.readyState >= 2) {
+          ctx.drawImage(videoEl, 0, 0, canvasEl.width, canvasEl.height);
+        }
+        requestAnimationFrame(drawLoop);
+      }
+      drawLoop();
+
+      function sendSignal(payload) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        ws.send(JSON.stringify({ sender: clientId, room: `${roomId}-view`, ...payload }));
+      }
+
+      function connectSignaling() {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+          return;
+        }
+        ws = new WebSocket(signalingUrl);
+        wsState = "connecting";
+        updateStatus();
+
+        ws.onopen = () => {
+          wsState = "open";
+          updateStatus();
+          sendSignal({ type: "join" });
+          sendSignal({ type: "ready" });
+        };
+
+        ws.onclose = () => {
+          wsState = "closed";
+          updateStatus();
+        };
+
+        ws.onerror = () => {
+          wsState = "error";
+          updateStatus("ws error");
+        };
+
+        ws.onmessage = async (evt) => {
+          let msg = null;
+          try {
+            msg = JSON.parse(evt.data);
+          } catch {
+            return;
+          }
+          if (!msg || msg.sender === clientId) return;
+          if (msg.room && msg.room !== `${roomId}-view`) return;
+
+          if (msg.type === "offer" && msg.sdp && msg.to === clientId) {
+            broadcasterId = msg.sender;
+            await ensurePeer();
+            await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            sendSignal({ type: "answer", sdp: pc.localDescription.sdp, to: broadcasterId });
+            updateStatus();
+            return;
+          }
+          if (msg.type === "ice" && msg.candidate && msg.to === clientId) {
+            if (!pc) return;
+            try {
+              await pc.addIceCandidate(msg.candidate);
+            } catch {}
+            updateStatus();
+            return;
+          }
+        };
+      }
+
+      async function ensurePeer() {
+        if (pc) return;
+        pc = new RTCPeerConnection({
+          iceServers: [
+            { urls: "stun:3.37.140.87:3478" },
+            {
+              urls: [
+                "turn:3.37.140.87:3478?transport=udp",
+                "turn:3.37.140.87:3478?transport=tcp",
+              ],
+              username: "imuuser",
+              credential: "imupass",
+            },
+          ],
+        });
+
+        pc.onicecandidate = (e) => {
+          if (!e.candidate || !broadcasterId) return;
+          const obj = {
+            candidate: e.candidate.candidate,
+            sdpMLineIndex: e.candidate.sdpMLineIndex,
+            sdpMid: e.candidate.sdpMid,
+          };
+          sendSignal({ type: "ice", candidate: obj, to: broadcasterId });
+        };
+
+        pc.ontrack = (e) => {
+          if (videoEl.srcObject !== e.streams[0]) {
+            videoEl.srcObject = e.streams[0];
+            videoEl.play().catch(() => {});
+          }
+        };
+
+        pc.onconnectionstatechange = () => updateStatus();
+        updateStatus();
+      }
+
+      function joinBroadcast() {
+        roomId = (roomInput && roomInput.value.trim()) || "imu";
+        updateStatus("joining...");
+        connectSignaling();
+      }
+
+      btnJoin.onclick = joinBroadcast;
+      btnJoin.ontouchstart = (e) => {
+        e.preventDefault();
+        joinBroadcast();
+      };
+
+      window.addEventListener("beforeunload", () => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.close(1000, "page unload");
+        }
+        if (pc) {
+          try {
+            pc.close();
+          } catch {}
+        }
+      });
+
+      updateStatus();
+    </script>
+  </body>
+</html>

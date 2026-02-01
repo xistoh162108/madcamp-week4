@@ -60,6 +60,7 @@
       <div class="row">
         <button id="btnStart">Start</button>
         <button id="btnCalibrate">Zero (1-shot)</button>
+        <button id="btnBroadcast">Start Broadcast</button>
       </div>
 
       <div id="stats">waiting...</div>
@@ -90,6 +91,9 @@
         100,
       );
       camera.position.set(0, 1.2, 3);
+      const stereo = new THREE.StereoCamera();
+      stereo.eyeSep = 0.064;
+      let sbsEnabled = false;
 
       scene.add(new THREE.HemisphereLight(undefined, undefined, 1.0));
       const dir = new THREE.DirectionalLight(undefined, 1.0);
@@ -134,8 +138,32 @@
         renderer.setSize(window.innerWidth, window.innerHeight);
       });
 
+      function renderSbs() {
+        const size = renderer.getSize(new THREE.Vector2());
+        const w = size.x;
+        const h = size.y;
+        const halfW = Math.floor(w / 2);
+
+        stereo.update(camera);
+        renderer.setScissorTest(true);
+
+        renderer.setViewport(0, 0, halfW, h);
+        renderer.setScissor(0, 0, halfW, h);
+        renderer.render(scene, stereo.cameraL);
+
+        renderer.setViewport(halfW, 0, w - halfW, h);
+        renderer.setScissor(halfW, 0, w - halfW, h);
+        renderer.render(scene, stereo.cameraR);
+
+        renderer.setScissorTest(false);
+      }
+
       function animate() {
-        renderer.render(scene, camera);
+        if (sbsEnabled) {
+          renderSbs();
+        } else {
+          renderer.render(scene, camera);
+        }
         requestAnimationFrame(animate);
       }
       animate();
@@ -148,6 +176,7 @@
       const statsEl = document.getElementById("stats");
       const roomInput = document.getElementById("roomId");
       const btnCalibrate = document.getElementById("btnCalibrate");
+      const btnBroadcast = document.getElementById("btnBroadcast");
 
       let pc = null;
       let dc = null;
@@ -160,6 +189,14 @@
         (crypto && crypto.randomUUID && crypto.randomUUID()) ||
         Math.random().toString(36).slice(2);
       let localIceLines = [];
+      let broadcastStream = null;
+      let broadcastTrack = null;
+
+      const broadcastId = `${clientId}-b`;
+      let broadcastWs = null;
+      let broadcastWsState = "disconnected";
+      const broadcastPeers = new Map(); // viewerId -> RTCPeerConnection
+      let broadcastLastEvent = "";
 
       // ---------- AR pose packet parsing (40 bytes) ----------
       // Layout:
@@ -205,6 +242,8 @@
         statsEl.textContent = `pc: ${pc ? pc.connectionState : "none"} / ice: ${pc ? pc.iceConnectionState : "none"}
           dc: ${dc ? dc.readyState : "none"}
           ws: ${wsState}
+          broadcast: ${broadcastWsState} / viewers: ${broadcastPeers.size}
+          bcast: ${broadcastLastEvent}
           rxHz: ${lastRxHz.toFixed(1)}
           seq: ${lastSeq}
           t: ${lastT.toFixed(3)}
@@ -277,6 +316,187 @@
       function sendSignal(payload) {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
         ws.send(JSON.stringify({ sender: clientId, ...payload }));
+      }
+
+      function ensureBroadcastTrack() {
+        if (broadcastTrack) return broadcastTrack;
+        if (!renderer.domElement.captureStream) return null;
+        broadcastStream = renderer.domElement.captureStream(12);
+        broadcastTrack = broadcastStream.getVideoTracks()[0] || null;
+        return broadcastTrack;
+      }
+
+      function connectBroadcastSignaling() {
+        if (
+          broadcastWs &&
+          (broadcastWs.readyState === WebSocket.OPEN ||
+            broadcastWs.readyState === WebSocket.CONNECTING)
+        ) {
+          return;
+        }
+        broadcastWs = new WebSocket(signalingUrl);
+        broadcastWsState = "connecting";
+        updateStats();
+
+        broadcastWs.onopen = () => {
+          broadcastWsState = "open";
+          updateStats();
+          sendBroadcastSignal({ type: "join", room: `${roomId}-view` });
+          sendBroadcastSignal({ type: "hello" });
+        };
+
+        broadcastWs.onclose = () => {
+          broadcastWsState = "closed";
+          updateStats();
+        };
+
+        broadcastWs.onerror = () => {
+          broadcastWsState = "error";
+          updateStats();
+        };
+
+        broadcastWs.onmessage = async (evt) => {
+          let msg = null;
+          try {
+            msg = JSON.parse(evt.data);
+          } catch {
+            return;
+          }
+          if (!msg || msg.sender === broadcastId) return;
+          if (msg.room && msg.room !== `${roomId}-view`) return;
+
+          if (msg.type === "ready") {
+            broadcastLastEvent = `ready from ${msg.sender.slice(0, 6)}`;
+            ensureBroadcastPeer(msg.sender);
+            sendBroadcastSignal({ type: "hello", to: msg.sender });
+            updateStats();
+            return;
+          }
+          if (msg.type === "offer" && msg.sdp && (!msg.to || msg.to === broadcastId)) {
+            const pcView = ensureBroadcastPeer(msg.sender);
+            if (!pcView) return;
+            await pcView.setRemoteDescription({ type: "offer", sdp: msg.sdp });
+            const answer = await pcView.createAnswer();
+            await pcView.setLocalDescription(answer);
+            sendBroadcastSignal({
+              type: "answer",
+              sdp: pcView.localDescription.sdp,
+              to: msg.sender,
+            });
+            broadcastLastEvent = `answer to ${msg.sender.slice(0, 6)}`;
+            updateStats();
+            return;
+          }
+          if (msg.type === "answer" && msg.sdp && msg.to === broadcastId) {
+            const pc = broadcastPeers.get(msg.sender);
+            if (!pc) return;
+            await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+            broadcastLastEvent = `answer from ${msg.sender.slice(0, 6)}`;
+            updateStats();
+            return;
+          }
+          if (msg.type === "ice" && msg.candidate && msg.to === broadcastId) {
+            const pc = broadcastPeers.get(msg.sender);
+            if (!pc) return;
+            try {
+              await pc.addIceCandidate(msg.candidate);
+            } catch {}
+            broadcastLastEvent = `ice from ${msg.sender.slice(0, 6)}`;
+            updateStats();
+            return;
+          }
+        };
+      }
+
+      function sendBroadcastSignal(payload) {
+        if (!broadcastWs || broadcastWs.readyState !== WebSocket.OPEN) return;
+        broadcastWs.send(
+          JSON.stringify({
+            sender: broadcastId,
+            room: `${roomId}-view`,
+            ...payload,
+          }),
+        );
+      }
+
+      async function makeBroadcastOffer(viewerId, pcView) {
+        const offer = await pcView.createOffer();
+        await pcView.setLocalDescription(offer);
+        sendBroadcastSignal({
+          type: "offer",
+          sdp: pcView.localDescription.sdp,
+          to: viewerId,
+        });
+        broadcastLastEvent = `offer to ${viewerId.slice(0, 6)}`;
+        updateStats();
+      }
+
+      function ensureBroadcastPeer(viewerId) {
+        if (broadcastPeers.has(viewerId)) return broadcastPeers.get(viewerId);
+        const track = ensureBroadcastTrack();
+        if (!track) {
+          alert("captureStream is not supported in this browser.");
+          return null;
+        }
+        const pcView = new RTCPeerConnection({
+          iceServers: [
+            { urls: "stun:3.37.140.87:3478" },
+            {
+              urls: [
+                "turn:3.37.140.87:3478?transport=udp",
+                "turn:3.37.140.87:3478?transport=tcp",
+              ],
+              username: "imuuser",
+              credential: "imupass",
+            },
+          ],
+        });
+        broadcastPeers.set(viewerId, pcView);
+
+        if (pcView.addStream) {
+          // Legacy Plan-B path for older browsers (e.g., Samsung Internet)
+          pcView.addStream(broadcastStream);
+        } else {
+          pcView.addTrack(track, broadcastStream);
+        }
+
+        pcView.onicecandidate = (e) => {
+          if (!e.candidate) return;
+          const obj = {
+            candidate: e.candidate.candidate,
+            sdpMLineIndex: e.candidate.sdpMLineIndex,
+            sdpMid: e.candidate.sdpMid,
+          };
+          sendBroadcastSignal({ type: "ice", candidate: obj, to: viewerId });
+        };
+
+        pcView.onconnectionstatechange = () => {
+          if (
+            pcView.connectionState === "failed" ||
+            pcView.connectionState === "closed"
+          ) {
+            broadcastPeers.delete(viewerId);
+          }
+          updateStats();
+        };
+
+        return pcView;
+      }
+
+      function stopBroadcast() {
+        for (const [, pcView] of broadcastPeers) {
+          try {
+            pcView.close();
+          } catch {}
+        }
+        broadcastPeers.clear();
+        if (broadcastWs && broadcastWs.readyState === WebSocket.OPEN) {
+          broadcastWs.close(1000, "broadcast stop");
+        }
+        broadcastWs = null;
+        broadcastWsState = "disconnected";
+        sbsEnabled = false;
+        updateStats();
       }
 
       async function start() {
@@ -403,9 +623,28 @@
           z: lastSample.pz,
         };
       };
+      btnBroadcast.onclick = () => {
+        if (broadcastWsState === "open" || broadcastWsState === "connecting") {
+          stopBroadcast();
+          btnBroadcast.textContent = "Start Broadcast";
+          return;
+        }
+        roomId = (roomInput && roomInput.value.trim()) || "imu";
+        sbsEnabled = true;
+        connectBroadcastSignaling();
+        btnBroadcast.textContent = "Stop Broadcast";
+      };
       window.addEventListener("beforeunload", () => {
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.close(1000, "page unload");
+        }
+        if (broadcastWs && broadcastWs.readyState === WebSocket.OPEN) {
+          broadcastWs.close(1000, "page unload");
+        }
+        for (const [, pcView] of broadcastPeers) {
+          try {
+            pcView.close();
+          } catch {}
         }
       });
     </script>
