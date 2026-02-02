@@ -24,7 +24,20 @@
         background: rgba(0, 0, 0, 0.65);
         padding: 10px;
         border-radius: 10px;
-        width: 260px;
+        width: 240px;
+      }
+      #ui.min {
+        opacity: 0.2;
+      }
+      #ui.min {
+        pointer-events: none;
+      }
+      #ui.min #btnFull {
+        pointer-events: auto;
+      }
+      #ui.min button:not(#btnFull),
+      #ui.min input {
+        display: none;
       }
       #ui input {
         width: 100%;
@@ -41,6 +54,9 @@
         white-space: pre;
         margin-top: 8px;
       }
+      #btnFull {
+        margin-top: 6px;
+      }
       video {
         position: fixed;
         inset: 0;
@@ -51,12 +67,19 @@
         z-index: 0;
         pointer-events: none;
       }
+      body.fullscreen #ui {
+        display: none;
+      }
+      body.fullscreen video {
+        object-fit: contain;
+      }
     </style>
   </head>
   <body>
     <div id="ui">
-      <input id="roomId" value="imu" />
+      <input id="roomId" value="imu-view" />
       <button id="btnJoin">Join Broadcast</button>
+      <button id="btnFull">Fullscreen</button>
       <div id="status">idle v2</div>
     </div>
 
@@ -67,6 +90,7 @@
       var btnJoin = document.getElementById("btnJoin");
       var statusEl = document.getElementById("status");
       var videoEl = document.getElementById("video");
+      var btnFull = document.getElementById("btnFull");
       statusEl.textContent = "js loaded v2";
 
       var signalingUrl = "ws://3.37.140.87:8080";
@@ -80,10 +104,18 @@
       var roomId = "imu";
       var broadcasterId = null;
       var hasOffer = false;
-      var localOffered = false;
       var readyTimer = null;
       var msgCount = 0;
       var lastMsg = "";
+
+      var eventLog = [];
+
+      function pushLog(line) {
+        eventLog.push(line);
+        if (eventLog.length > 50) {
+          eventLog.shift();
+        }
+      }
 
       function updateStatus(extra) {
         var pcState = "none";
@@ -97,7 +129,8 @@
           "\npc: " + pcState +
           "\nice: " + iceState +
           "\nmsg: " + msgCount +
-          (lastMsg ? "\nlast: " + lastMsg : "");
+          (lastMsg ? "\nlast: " + lastMsg : "") +
+          (eventLog.length ? "\nlog:\n" + eventLog.join("\n") : "");
         if (extra) {
           statusEl.textContent += "\n" + extra;
         }
@@ -108,7 +141,8 @@
         ws.send(
           JSON.stringify({
             sender: clientId,
-            room: roomId + "-view",
+            viewerId: clientId,
+            room: roomId,
             type: payload.type,
             sdp: payload.sdp,
             candidate: payload.candidate,
@@ -123,9 +157,6 @@
           if (ws.readyState === WebSocket.OPEN) {
             sendSignal({ type: "join" });
             sendSignal({ type: "ready" });
-            if (broadcasterId && !localOffered) {
-              createLocalOffer();
-            }
           }
           return;
         }
@@ -147,9 +178,6 @@
           updateStatus();
           sendSignal({ type: "join" });
           sendSignal({ type: "ready" });
-          if (broadcasterId && !localOffered) {
-            createLocalOffer();
-          }
           if (readyTimer) {
             clearInterval(readyTimer);
           }
@@ -157,9 +185,6 @@
             if (!hasOffer && ws && ws.readyState === WebSocket.OPEN) {
               sendSignal({ type: "ready" });
               updateStatus("ready retry");
-              if (broadcasterId && !localOffered) {
-                createLocalOffer();
-              }
             }
           }, 2000);
         };
@@ -187,80 +212,225 @@
         ws.onmessage = function (evt) {
           var msg = null;
           try {
-            msg = JSON.parse(evt.data);
-          } catch (e) {
-            return;
-          }
-          msgCount += 1;
-          lastMsg = (msg && msg.type ? msg.type : "unknown") + " from " + (msg && msg.sender ? msg.sender : "?");
-          updateStatus();
+          msg = JSON.parse(evt.data);
+        } catch (e) {
+          return;
+        }
+        msgCount += 1;
+        lastMsg = (msg && msg.type ? msg.type : "unknown") + " from " + (msg && msg.sender ? msg.sender : "?");
+        pushLog("msg " + lastMsg);
+        updateStatus();
           if (!msg || msg.sender === clientId) return;
-          if (msg.room && msg.room !== roomId + "-view") return;
+          if (msg.room && msg.room !== roomId) return;
 
           if (msg.type === "hello") {
             broadcasterId = msg.sender;
+            pushLog("hello recv");
             updateStatus("hello recv");
-            if (!localOffered) {
-              createLocalOffer();
-            }
             return;
           }
-          if (msg.type === "offer" && msg.sdp && (!msg.to || msg.to === clientId)) {
-            if (localOffered) {
-              updateStatus("offer ignored");
-              return;
-            }
+          if (msg.type === "offer" && msg.sdp) {
             broadcasterId = msg.sender;
             hasOffer = true;
+            pushLog("offer recv");
             updateStatus("offer recv");
             ensurePeer();
-            pc
-              .setRemoteDescription({ type: "offer", sdp: msg.sdp })
-              .then(function () {
-                var legacyConstraints = { mandatory: { OfferToReceiveVideo: true } };
-                try {
-                  return pc.createAnswer(legacyConstraints);
-                } catch (e) {
-                  return pc.createAnswer();
-                }
-              })
-              .then(function (answer) {
-                return pc.setLocalDescription(answer);
-              })
-              .then(function () {
-                sendSignal({ type: "answer", sdp: pc.localDescription.sdp, to: broadcasterId });
-                updateStatus("answer sent");
-              })
-              .catch(function () {
-                updateStatus("offer err");
-              });
+            var rawSdp = msg.sdp;
+            var normalizedSdp = normalizeSdp(msg.sdp);
+            var legacySdp = sanitizeSdpForOldChrome(normalizedSdp);
+            var rawInfo = summarizeSdp(rawSdp);
+            var normInfo = summarizeSdp(normalizedSdp);
+            var legacyInfo = summarizeSdp(legacySdp);
+            pushLog("offer raw: " + rawInfo);
+            pushLog("offer norm: " + normInfo);
+            pushLog("offer leg: " + legacyInfo);
+            logSdpDiagnostics(rawSdp, "raw");
+            logSdpDiagnostics(normalizedSdp, "norm");
+            logSdpDiagnostics(legacySdp, "leg");
+
+            function applyOfferWithSdp(sdpText, label, useFallback, nextLabel) {
+              var sdpToUse = forceSplitSdp(sdpText);
+              return pc
+                .setRemoteDescription({ type: "offer", sdp: sdpToUse })
+                .then(function () {
+                  var legacyConstraints = { mandatory: { OfferToReceiveVideo: true } };
+                  try {
+                    return pc.createAnswer(legacyConstraints);
+                  } catch (e) {
+                    return pc.createAnswer();
+                  }
+                })
+                .then(function (answer) {
+                  return pc.setLocalDescription(answer);
+                })
+                .then(function () {
+                  sendSignal({ type: "answer", sdp: pc.localDescription.sdp, to: broadcasterId });
+                  pushLog("answer sent (" + label + ")");
+                  updateStatus("answer sent");
+                })
+                .catch(function (err) {
+                  var msgText = err && err.message ? err.message : "offer err";
+                  var bad = findInvalidSdpLine(sdpToUse);
+                  if (bad) {
+                    pushLog(label + " bad line: " + bad);
+                  } else {
+                    logSdpSample(sdpToUse, label);
+                  }
+                  pushLog(label + " err: " + msgText);
+                  updateStatus(label + " err");
+                  if (useFallback) {
+                    if (nextLabel === "norm") {
+                      return applyOfferWithSdp(normalizedSdp, "norm", true, "leg");
+                    }
+                    if (nextLabel === "leg") {
+                      return applyOfferWithSdp(legacySdp, "leg", false);
+                    }
+                  }
+                });
+            }
+
+            applyOfferWithSdp(rawSdp, "raw", rawSdp !== normalizedSdp, "norm");
             return;
           }
-          if (msg.type === "answer" && msg.sdp && (!msg.to || msg.to === clientId)) {
+          if (msg.type === "answer" && msg.sdp) {
             if (!pc) return;
             pc
-              .setRemoteDescription({ type: "answer", sdp: msg.sdp })
+              .setRemoteDescription({ type: "answer", sdp: normalizeSdp(msg.sdp) })
               .then(function () {
+                pushLog("answer recv");
                 updateStatus("answer recv");
               })
-              .catch(function () {
+              .catch(function (err) {
+                var msgText = err && err.message ? err.message : "answer err";
+                var bad = findInvalidSdpLine(msg.sdp);
+                if (bad) {
+                  pushLog("answer bad line: " + bad);
+                }
+                pushLog("answer err: " + msgText);
                 updateStatus("answer err");
               });
             return;
           }
-          if (msg.type === "ice" && msg.candidate && (!msg.to || msg.to === clientId)) {
+          if (msg.type === "ice" && msg.candidate) {
             if (!pc) return;
             try {
               pc.addIceCandidate(msg.candidate);
             } catch (e) {}
+            pushLog("ice recv");
             updateStatus("ice recv");
             if (!hasOffer && ws && ws.readyState === WebSocket.OPEN) {
               sendSignal({ type: "ready" });
+              pushLog("ready retry");
               updateStatus("ready retry");
             }
             return;
           }
         };
+      }
+
+      function normalizeSdp(rawSdp) {
+        if (!rawSdp) return rawSdp;
+        var sdp = String(rawSdp).trim();
+        // Handle SDP passed with escaped newlines (e.g. "\\n" or "\\r\\n")
+        if (sdp.indexOf("\\n") !== -1 || sdp.indexOf("\\r") !== -1) {
+          sdp = sdp.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\\r/g, "\n");
+        }
+        sdp = forceSplitSdp(sdp);
+        var lines = sdp.split(/\r\n/);
+        var filtered = [];
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i];
+          if (!line) continue;
+          if (line.indexOf("a=max-message-size:") === 0) continue;
+          if (line.indexOf("a=extmap-allow-mixed") === 0) continue;
+          if (line.indexOf("a=extmap:") === 0) continue;
+          if (line.indexOf("a=rtcp-rsize") === 0) continue;
+          filtered.push(line);
+        }
+        sdp = filtered.join("\r\n");
+        sdp = sdp.replace(/^a=setup:actpass\r\n?$/gm, "a=setup:active\r\n");
+        return sdp;
+      }
+
+      function findInvalidSdpLine(rawSdp) {
+        if (!rawSdp) return null;
+        var lines = String(rawSdp).split(/\r\n|\n/);
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i];
+          if (!line) continue;
+          if (!/^[a-z]=/.test(line)) {
+            return line;
+          }
+        }
+        return null;
+      }
+
+      function logSdpSample(rawSdp, label) {
+        if (!rawSdp) return;
+        var lines = forceSplitSdp(String(rawSdp)).split(/\r\n|\n/);
+        var sample = [];
+        for (var i = 0; i < lines.length && i < 12; i++) {
+          if (lines[i]) sample.push(lines[i]);
+        }
+        if (sample.length) {
+          pushLog(label + " sdp head:");
+          for (var j = 0; j < sample.length; j++) {
+            pushLog(sample[j]);
+          }
+        }
+      }
+
+      function summarizeSdp(rawSdp) {
+        if (!rawSdp) return "empty";
+        var s = forceSplitSdp(String(rawSdp));
+        var hasLf = s.indexOf("\n") !== -1;
+        var hasCr = s.indexOf("\r") !== -1;
+        var hasEsc = s.indexOf("\\n") !== -1 || s.indexOf("\\r") !== -1;
+        var lineCount = s.split(/\r\n|\n/).filter(Boolean).length;
+        return "len=" + s.length + " lf=" + hasLf + " cr=" + hasCr + " esc=" + hasEsc + " lines=" + lineCount;
+      }
+
+      function sanitizeSdpForOldChrome(rawSdp) {
+        if (!rawSdp) return rawSdp;
+        var sdp = String(rawSdp);
+        // Ensure line breaks exist before line-based removals.
+        sdp = forceSplitSdp(sdp);
+        sdp = sdp
+          .replace(/^a=extmap-allow-mixed.*(?:\r\n|\r|\n)?/gm, "")
+          .replace(/^a=extmap:.*(?:\r\n|\r|\n)?/gm, "")
+          .replace(/^a=rtcp-rsize.*(?:\r\n|\r|\n)?/gm, "")
+          .replace(/^a=max-message-size:.*(?:\r\n|\r|\n)?/gm, "")
+          .replace(/^a=msid-semantic:.*(?:\r\n|\r|\n)?/gm, "")
+          .replace(/^a=msid:.*(?:\r\n|\r|\n)?/gm, "");
+        return sdp;
+      }
+
+      function forceSplitSdp(rawSdp) {
+        if (!rawSdp) return rawSdp;
+        var sdp = String(rawSdp);
+        sdp = sdp.replace(/\u2028|\u2029/g, "\n");
+        sdp = sdp.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        // Always split if multiple "x=" tokens are on the same line.
+        sdp = sdp.replace(/[ \t\u00a0]+([vosctamb])=/g, "\n$1=");
+        sdp = sdp.replace(/\n+/g, "\n").replace(/\n/g, "\r\n");
+        return sdp;
+      }
+
+      function logSdpDiagnostics(rawSdp, label) {
+        if (!rawSdp) return;
+        var lines = String(rawSdp).split(/\r\n|\n/);
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i];
+          if (!line) continue;
+          if (!/^[a-z]=/.test(line)) {
+            var chars = [];
+            for (var j = 0; j < line.length && j < 12; j++) {
+              chars.push(line.charCodeAt(j).toString(16));
+            }
+            console.log("[sdp diag]", label, "bad line", i, line, chars.join(" "));
+            break;
+          }
+        }
       }
 
       function ensurePeer() {
@@ -281,13 +451,18 @@
         });
 
         pc.onicecandidate = function (e) {
-          if (!e.candidate || !broadcasterId) return;
+          if (!e.candidate) return;
           var obj = {
             candidate: e.candidate.candidate,
             sdpMLineIndex: e.candidate.sdpMLineIndex,
             sdpMid: e.candidate.sdpMid,
           };
-          sendSignal({ type: "ice", candidate: obj, to: broadcasterId });
+          if (broadcasterId) {
+            sendSignal({ type: "ice", candidate: obj, to: broadcasterId });
+          } else {
+            sendSignal({ type: "ice", candidate: obj });
+          }
+          pushLog("ice sent");
           updateStatus("ice sent");
         };
 
@@ -297,6 +472,7 @@
             try {
               videoEl.play();
             } catch (err) {}
+            pushLog("track received");
             updateStatus("track received");
           }
         };
@@ -307,6 +483,7 @@
             try {
               videoEl.play();
             } catch (err) {}
+            pushLog("stream received");
             updateStatus("stream received");
           }
         };
@@ -322,39 +499,17 @@
       }
 
       function createLocalOffer() {
-        if (localOffered) return;
-        if (!broadcasterId) return;
         ensurePeer();
-        localOffered = true;
-        updateStatus("offer send");
-        var legacyConstraints = { mandatory: { OfferToReceiveVideo: true } };
-        var offerPromise = null;
-        try {
-          offerPromise = pc.createOffer(legacyConstraints);
-        } catch (e) {
-          offerPromise = pc.createOffer();
-        }
-        offerPromise
-          .then(function (offer) {
-            return pc.setLocalDescription(offer);
-          })
-          .then(function () {
-            sendSignal({ type: "offer", sdp: pc.localDescription.sdp, to: broadcasterId });
-            updateStatus("offer sent");
-          })
-          .catch(function () {
-            localOffered = false;
-            updateStatus("offer err");
-          });
       }
 
       function joinBroadcast() {
-        roomId = (roomInput && roomInput.value.trim()) || "imu";
+        roomId = (roomInput && roomInput.value.trim()) || "imu-view";
         hasOffer = false;
-        localOffered = false;
         msgCount = 0;
         lastMsg = "";
+        eventLog = [];
         updateStatus("joining...");
+        document.getElementById("ui").classList.add("min");
         if (ws && ws.readyState === WebSocket.CLOSING) {
           try {
             ws.close();
@@ -372,6 +527,37 @@
         e.preventDefault();
         joinBroadcast();
       };
+
+      function requestFullscreen() {
+        var el = document.documentElement;
+        if (el.requestFullscreen) return el.requestFullscreen();
+        if (el.webkitRequestFullscreen) return el.webkitRequestFullscreen();
+        if (el.msRequestFullscreen) return el.msRequestFullscreen();
+      }
+
+      btnFull.onclick = function () {
+        requestFullscreen();
+      };
+      btnFull.ontouchstart = function (e) {
+        e.preventDefault();
+        requestFullscreen();
+      };
+
+      function autoHideBars() {
+        window.scrollTo(0, 1);
+        setTimeout(function () {
+          window.scrollTo(0, 1);
+        }, 200);
+      }
+      window.addEventListener("load", autoHideBars);
+      window.addEventListener("orientationchange", autoHideBars);
+      document.addEventListener("fullscreenchange", function () {
+        var isFull = !!document.fullscreenElement;
+        document.body.classList.toggle("fullscreen", isFull);
+        if (isFull) {
+          autoHideBars();
+        }
+      });
 
       window.addEventListener("beforeunload", function () {
         if (ws && ws.readyState === WebSocket.OPEN) {

@@ -55,7 +55,8 @@
   <body>
     <div id="ui">
       <div class="row">
-        <input id="roomId" value="imu" />
+        <input id="roomIdSensor" value="imu-data" />
+        <input id="roomIdView" value="imu-view" />
       </div>
       <div class="row">
         <button id="btnStart">Start</button>
@@ -174,29 +175,15 @@
       const iceOut = null;
       const iceIn = null;
       const statsEl = document.getElementById("stats");
-      const roomInput = document.getElementById("roomId");
+      const roomInputSensor = document.getElementById("roomIdSensor");
+      const roomInputView = document.getElementById("roomIdView");
       const btnCalibrate = document.getElementById("btnCalibrate");
       const btnBroadcast = document.getElementById("btnBroadcast");
 
-      let pc = null;
-      let dc = null;
-      let ws = null;
-      let wsState = "disconnected";
-      let lastOfferSdp = "";
       const signalingUrl = "ws://3.37.140.87:8080";
-      let roomId = "imu";
       const clientId =
         (crypto && crypto.randomUUID && crypto.randomUUID()) ||
         Math.random().toString(36).slice(2);
-      let localIceLines = [];
-      let broadcastStream = null;
-      let broadcastTrack = null;
-
-      const broadcastId = `${clientId}-b`;
-      let broadcastWs = null;
-      let broadcastWsState = "disconnected";
-      const broadcastPeers = new Map(); // viewerId -> RTCPeerConnection
-      let broadcastLastEvent = "";
 
       // ---------- AR pose packet parsing (40 bytes) ----------
       // Layout:
@@ -239,11 +226,13 @@
       }
 
       function updateStats() {
-        statsEl.textContent = `pc: ${pc ? pc.connectionState : "none"} / ice: ${pc ? pc.iceConnectionState : "none"}
-          dc: ${dc ? dc.readyState : "none"}
-          ws: ${wsState}
-          broadcast: ${broadcastWsState} / viewers: ${broadcastPeers.size}
-          bcast: ${broadcastLastEvent}
+        const sensor = sensorLink.getState();
+        const bcast = broadcastLink.getState();
+        statsEl.textContent = `pc: ${sensor.pcState} / ice: ${sensor.iceState}
+          dc: ${sensor.dcState}
+          ws: ${sensor.wsState}
+          broadcast: ${bcast.wsState} / viewers: ${bcast.viewers}
+          bcast: ${bcast.lastEvent}
           rxHz: ${lastRxHz.toFixed(1)}
           seq: ${lastSeq}
           t: ${lastT.toFixed(3)}
@@ -252,369 +241,504 @@
       }
       setInterval(updateStats, 200);
 
-      function connectSignaling() {
-        if (
-          ws &&
-          (ws.readyState === WebSocket.OPEN ||
-            ws.readyState === WebSocket.CONNECTING)
-        ) {
-          return;
+      function createSensorLink(opts) {
+        const roomId = opts.roomId;
+        const onPacket = opts.onPacket;
+        const state = {
+          wsState: "disconnected",
+          pcState: "none",
+          iceState: "none",
+          dcState: "none",
+        };
+
+        let pc = null;
+        let dc = null;
+        let ws = null;
+        let lastOfferSdp = "";
+        let localIceLines = [];
+
+        function updateState() {
+          state.pcState = pc ? pc.connectionState || "unknown" : "none";
+          state.iceState = pc ? pc.iceConnectionState || "unknown" : "none";
+          state.dcState = dc ? dc.readyState || "unknown" : "none";
         }
-        ws = new WebSocket(signalingUrl);
-        wsState = "connecting";
-        updateStats();
 
-        ws.onopen = () => {
-          wsState = "open";
-          updateStats();
-          sendSignal({ type: "join", room: roomId || "imu" });
-          if (lastOfferSdp) {
-            sendSignal({ type: "offer", sdp: lastOfferSdp });
-          } else if (pc) {
-            createOffer();
-          }
-        };
+        function sendSignal(payload) {
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          ws.send(
+            JSON.stringify({ sender: clientId, room: roomId(), ...payload }),
+          );
+        }
 
-        ws.onclose = () => {
-          wsState = "closed";
-          updateStats();
-        };
-
-        ws.onerror = () => {
-          wsState = "error";
-          updateStats();
-        };
-
-        ws.onmessage = async (evt) => {
-          let msg = null;
-          try {
-            msg = JSON.parse(evt.data);
-          } catch {
+        function connectSignaling() {
+          if (
+            ws &&
+            (ws.readyState === WebSocket.OPEN ||
+              ws.readyState === WebSocket.CONNECTING)
+          ) {
             return;
           }
-          if (msg && msg.sender && msg.sender === clientId) return;
+          ws = new WebSocket(signalingUrl);
+          state.wsState = "connecting";
+          updateState();
+
+          ws.onopen = () => {
+            state.wsState = "open";
+            updateState();
+            sendSignal({ type: "join" });
+            if (lastOfferSdp) {
+              sendSignal({ type: "offer", sdp: lastOfferSdp });
+            } else if (pc) {
+              createOffer();
+            }
+          };
+
+          ws.onclose = () => {
+            state.wsState = "closed";
+            updateState();
+          };
+
+          ws.onerror = () => {
+            state.wsState = "error";
+            updateState();
+          };
+
+          ws.onmessage = async (evt) => {
+            let msg = null;
+            try {
+              msg = JSON.parse(evt.data);
+            } catch {
+              return;
+            }
+            if (msg && msg.sender && msg.sender === clientId) return;
+            if (!pc) return;
+
+            if (msg.type === "answer" && msg.sdp) {
+              await setRemoteAnswerSdp(msg.sdp);
+              return;
+            }
+            if (msg.type === "ready") {
+              if (pc) createOffer();
+              return;
+            }
+            if (msg.type === "ice" && msg.candidate) {
+              try {
+                await pc.addIceCandidate(msg.candidate);
+                updateState();
+              } catch {}
+              return;
+            }
+          };
+        }
+
+        async function createOffer() {
           if (!pc) return;
-
-          if (msg.type === "answer" && msg.sdp) {
-            await setRemoteAnswerSdp(msg.sdp);
-            return;
-          }
-          if (msg.type === "ready") {
-            if (pc) createOffer();
-            return;
-          }
-          if (msg.type === "ice" && msg.candidate) {
-            try {
-              await pc.addIceCandidate(msg.candidate);
-              updateStats();
-            } catch {}
-            return;
-          }
-        };
-      }
-
-      function sendSignal(payload) {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        ws.send(JSON.stringify({ sender: clientId, ...payload }));
-      }
-
-      function ensureBroadcastTrack() {
-        if (broadcastTrack) return broadcastTrack;
-        if (!renderer.domElement.captureStream) return null;
-        broadcastStream = renderer.domElement.captureStream(12);
-        broadcastTrack = broadcastStream.getVideoTracks()[0] || null;
-        return broadcastTrack;
-      }
-
-      function connectBroadcastSignaling() {
-        if (
-          broadcastWs &&
-          (broadcastWs.readyState === WebSocket.OPEN ||
-            broadcastWs.readyState === WebSocket.CONNECTING)
-        ) {
-          return;
+          connectSignaling();
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          lastOfferSdp = pc.localDescription.sdp;
+          console.log("[sensor offer]", {
+            len: lastOfferSdp.length,
+            hasLf: lastOfferSdp.indexOf("\n") !== -1,
+            hasCr: lastOfferSdp.indexOf("\r") !== -1,
+            head: lastOfferSdp.split(/\r\n|\n/).slice(0, 6),
+          });
+          if (offerOut) offerOut.value = lastOfferSdp;
+          sendSignal({ type: "offer", sdp: lastOfferSdp });
+          updateState();
         }
-        broadcastWs = new WebSocket(signalingUrl);
-        broadcastWsState = "connecting";
-        updateStats();
 
-        broadcastWs.onopen = () => {
-          broadcastWsState = "open";
-          updateStats();
-          sendBroadcastSignal({ type: "join", room: `${roomId}-view` });
-          sendBroadcastSignal({ type: "hello" });
-        };
+        async function setRemoteAnswerSdp(rawSdp) {
+          if (!pc || !rawSdp) return;
+          let sdp = rawSdp.trim();
+          sdp = sdp
+            .replace(/\r\n/g, "\n")
+            .replace(/\n/g, "\r\n")
+            .replace(/^a=max-message-size:.*(?:\r\n|\r|\n)?/gm, "")
+            .replace(/^a=setup:actpass\r\n?$/gm, "a=setup:active\r\n");
+          await pc.setRemoteDescription({ type: "answer", sdp });
+          updateState();
+        }
 
-        broadcastWs.onclose = () => {
-          broadcastWsState = "closed";
-          updateStats();
-        };
+        function start() {
+          localIceLines = [];
 
-        broadcastWs.onerror = () => {
-          broadcastWsState = "error";
-          updateStats();
-        };
+          pc = new RTCPeerConnection({
+            sdpSemantics: "plan-b",
+            iceServers: [
+              { urls: "stun:3.37.140.87:3478" },
+              {
+                urls: [
+                  "turn:3.37.140.87:3478?transport=udp",
+                  "turn:3.37.140.87:3478?transport=tcp",
+                ],
+                username: "imuuser",
+                credential: "imupass",
+              },
+            ],
+          });
 
-        broadcastWs.onmessage = async (evt) => {
-          let msg = null;
-          try {
-            msg = JSON.parse(evt.data);
-          } catch {
-            return;
+          pc.onicecandidate = (e) => {
+            if (!e.candidate) return;
+            const obj = {
+              candidate: e.candidate.candidate,
+              sdpMLineIndex: e.candidate.sdpMLineIndex,
+              sdpMid: e.candidate.sdpMid,
+            };
+            localIceLines.push(JSON.stringify(obj));
+            if (iceOut) iceOut.value = localIceLines.join("\n");
+            sendSignal({ type: "ice", candidate: obj });
+          };
+
+          pc.oniceconnectionstatechange = () => updateState();
+          pc.onconnectionstatechange = () => updateState();
+
+          dc = pc.createDataChannel("imu", {
+            ordered: true,
+            maxRetransmits: 0,
+          });
+          dc.binaryType = "arraybuffer";
+
+          dc.onopen = () => updateState();
+          dc.onclose = () => updateState();
+
+          dc.onmessage = async (e) => {
+            const buf =
+              e.data instanceof ArrayBuffer
+                ? e.data
+                : await e.data.arrayBuffer();
+            onPacket(buf);
+          };
+
+          connectSignaling();
+          updateState();
+        }
+
+        function stop() {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.close(1000, "page unload");
           }
-          if (!msg || msg.sender === broadcastId) return;
-          if (msg.room && msg.room !== `${roomId}-view`) return;
-
-          if (msg.type === "ready") {
-            broadcastLastEvent = `ready from ${msg.sender.slice(0, 6)}`;
-            ensureBroadcastPeer(msg.sender);
-            sendBroadcastSignal({ type: "hello", to: msg.sender });
-            updateStats();
-            return;
-          }
-          if (msg.type === "offer" && msg.sdp && (!msg.to || msg.to === broadcastId)) {
-            const pcView = ensureBroadcastPeer(msg.sender);
-            if (!pcView) return;
-            await pcView.setRemoteDescription({ type: "offer", sdp: msg.sdp });
-            const answer = await pcView.createAnswer();
-            await pcView.setLocalDescription(answer);
-            sendBroadcastSignal({
-              type: "answer",
-              sdp: pcView.localDescription.sdp,
-              to: msg.sender,
-            });
-            broadcastLastEvent = `answer to ${msg.sender.slice(0, 6)}`;
-            updateStats();
-            return;
-          }
-          if (msg.type === "answer" && msg.sdp && msg.to === broadcastId) {
-            const pc = broadcastPeers.get(msg.sender);
-            if (!pc) return;
-            await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
-            broadcastLastEvent = `answer from ${msg.sender.slice(0, 6)}`;
-            updateStats();
-            return;
-          }
-          if (msg.type === "ice" && msg.candidate && msg.to === broadcastId) {
-            const pc = broadcastPeers.get(msg.sender);
-            if (!pc) return;
+          if (dc) {
             try {
-              await pc.addIceCandidate(msg.candidate);
+              dc.close();
             } catch {}
-            broadcastLastEvent = `ice from ${msg.sender.slice(0, 6)}`;
-            updateStats();
-            return;
           }
+          if (pc) {
+            try {
+              pc.close();
+            } catch {}
+          }
+          ws = null;
+          dc = null;
+          pc = null;
+          state.wsState = "disconnected";
+          updateState();
+        }
+
+        function getState() {
+          updateState();
+          return { ...state };
+        }
+
+        return { start, stop, getState };
+      }
+
+      function createBroadcastLink(opts) {
+        const roomId = opts.roomId;
+        const getStream = opts.getStream;
+        const state = {
+          wsState: "disconnected",
+          viewers: 0,
+          lastEvent: "",
         };
-      }
 
-      function sendBroadcastSignal(payload) {
-        if (!broadcastWs || broadcastWs.readyState !== WebSocket.OPEN) return;
-        broadcastWs.send(
-          JSON.stringify({
-            sender: broadcastId,
-            room: `${roomId}-view`,
-            ...payload,
-          }),
-        );
-      }
+        let broadcastWs = null;
+        const broadcastPeers = new Map();
 
-      async function makeBroadcastOffer(viewerId, pcView) {
-        const offer = await pcView.createOffer();
-        await pcView.setLocalDescription(offer);
-        sendBroadcastSignal({
-          type: "offer",
-          sdp: pcView.localDescription.sdp,
-          to: viewerId,
-        });
-        broadcastLastEvent = `offer to ${viewerId.slice(0, 6)}`;
-        updateStats();
-      }
+        function updateState() {
+          state.viewers = broadcastPeers.size;
+        }
 
-      function ensureBroadcastPeer(viewerId) {
-        if (broadcastPeers.has(viewerId)) return broadcastPeers.get(viewerId);
-        const track = ensureBroadcastTrack();
-        if (!track) {
-          alert("captureStream is not supported in this browser.");
+        function sendSignal(payload) {
+          if (!broadcastWs || broadcastWs.readyState !== WebSocket.OPEN) return;
+          broadcastWs.send(
+            JSON.stringify({
+              sender: clientId + "-b",
+              room: roomId(),
+              ...payload,
+            }),
+          );
+        }
+
+        async function makeOffer(viewerId, pcView, includeTo) {
+          const offer = await pcView.createOffer();
+          await pcView.setLocalDescription(offer);
+          const payload = { type: "offer", sdp: pcView.localDescription.sdp };
+          console.log("[bcast offer]", {
+            to: viewerId || "anon",
+            len: payload.sdp.length,
+            hasLf: payload.sdp.indexOf("\n") !== -1,
+            hasCr: payload.sdp.indexOf("\r") !== -1,
+            head: payload.sdp.split(/\r\n|\n/).slice(0, 6),
+          });
+          if (includeTo && viewerId) {
+            payload.to = viewerId;
+          }
+          sendSignal(payload);
+          state.lastEvent = viewerId
+            ? `offer to ${viewerId.slice(0, 6)}`
+            : "offer to anon";
+          updateState();
+        }
+
+        function ensurePeer(viewerId) {
+          if (broadcastPeers.has(viewerId)) return broadcastPeers.get(viewerId);
+          const stream = getStream();
+          if (!stream) {
+            alert("captureStream is not supported in this browser.");
+            return null;
+          }
+          const pcView = new RTCPeerConnection({
+            sdpSemantics: "plan-b",
+            iceServers: [
+              { urls: "stun:3.37.140.87:3478" },
+              {
+                urls: [
+                  "turn:3.37.140.87:3478?transport=udp",
+                  "turn:3.37.140.87:3478?transport=tcp",
+                ],
+                username: "imuuser",
+                credential: "imupass",
+              },
+            ],
+          });
+          broadcastPeers.set(viewerId, pcView);
+
+          if (pcView.addStream) {
+            pcView.addStream(stream);
+          } else {
+            const track = stream.getVideoTracks()[0];
+            if (track) pcView.addTrack(track, stream);
+          }
+
+          pcView.onicecandidate = (e) => {
+            if (!e.candidate) return;
+            const obj = {
+              candidate: e.candidate.candidate,
+              sdpMLineIndex: e.candidate.sdpMLineIndex,
+              sdpMid: e.candidate.sdpMid,
+            };
+            sendSignal({ type: "ice", candidate: obj, to: viewerId });
+          };
+
+          pcView.onconnectionstatechange = () => {
+            if (
+              pcView.connectionState === "failed" ||
+              pcView.connectionState === "closed"
+            ) {
+              broadcastPeers.delete(viewerId);
+            }
+            updateState();
+          };
+
+          return pcView;
+        }
+
+        function getAnyPeer() {
+          for (const [, pcView] of broadcastPeers) return pcView;
           return null;
         }
-        const pcView = new RTCPeerConnection({
-          iceServers: [
-            { urls: "stun:3.37.140.87:3478" },
-            {
-              urls: [
-                "turn:3.37.140.87:3478?transport=udp",
-                "turn:3.37.140.87:3478?transport=tcp",
-              ],
-              username: "imuuser",
-              credential: "imupass",
-            },
-          ],
-        });
-        broadcastPeers.set(viewerId, pcView);
 
-        if (pcView.addStream) {
-          // Legacy Plan-B path for older browsers (e.g., Samsung Internet)
-          pcView.addStream(broadcastStream);
-        } else {
-          pcView.addTrack(track, broadcastStream);
+        function connectSignaling() {
+          if (
+            broadcastWs &&
+            (broadcastWs.readyState === WebSocket.OPEN ||
+              broadcastWs.readyState === WebSocket.CONNECTING)
+          ) {
+            return;
+          }
+          broadcastWs = new WebSocket(signalingUrl);
+          state.wsState = "connecting";
+          updateState();
+
+          broadcastWs.onopen = () => {
+            state.wsState = "open";
+            updateState();
+            sendSignal({ type: "join" });
+          };
+
+          broadcastWs.onclose = () => {
+            state.wsState = "closed";
+            updateState();
+          };
+
+          broadcastWs.onerror = () => {
+            state.wsState = "error";
+            updateState();
+          };
+
+          broadcastWs.onmessage = async (evt) => {
+            let msg = null;
+            try {
+              msg = JSON.parse(evt.data);
+            } catch {
+              return;
+            }
+            if (!msg || msg.sender === clientId + "-b") return;
+            if (msg.room && msg.room !== roomId()) return;
+
+            const senderId = msg.sender || msg.viewerId || "";
+            if (
+              msg.type === "ready" ||
+              msg.type === "joined" ||
+              msg.type === "join"
+            ) {
+              if (!senderId) {
+                state.lastEvent = "ready from ?";
+                const anonId = "__anon__";
+                const pcView = ensurePeer(anonId);
+                if (pcView) {
+                  await makeOffer(null, pcView, false);
+                }
+                updateState();
+                return;
+              }
+              state.lastEvent = `ready from ${senderId.slice(0, 6)}`;
+              const pcView = ensurePeer(senderId);
+              if (pcView) {
+                await makeOffer(senderId, pcView, true);
+              }
+              updateState();
+              return;
+            }
+            if (
+              msg.type === "answer" &&
+              msg.sdp &&
+              (!msg.to || msg.to === clientId + "-b")
+            ) {
+              const pc = broadcastPeers.get(senderId) || getAnyPeer();
+              if (!pc) return;
+              await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+              state.lastEvent = senderId
+                ? `answer from ${senderId.slice(0, 6)}`
+                : "answer from ?";
+              updateState();
+              return;
+            }
+            if (
+              msg.type === "ice" &&
+              msg.candidate &&
+              (!msg.to || msg.to === clientId + "-b")
+            ) {
+              const pc = broadcastPeers.get(senderId) || getAnyPeer();
+              if (!pc) return;
+              try {
+                await pc.addIceCandidate(msg.candidate);
+              } catch {}
+              state.lastEvent = senderId
+                ? `ice from ${senderId.slice(0, 6)}`
+                : "ice from ?";
+              updateState();
+              return;
+            }
+          };
         }
 
-        pcView.onicecandidate = (e) => {
-          if (!e.candidate) return;
-          const obj = {
-            candidate: e.candidate.candidate,
-            sdpMLineIndex: e.candidate.sdpMLineIndex,
-            sdpMid: e.candidate.sdpMid,
-          };
-          sendBroadcastSignal({ type: "ice", candidate: obj, to: viewerId });
-        };
+        function start() {
+          connectSignaling();
+        }
 
-        pcView.onconnectionstatechange = () => {
-          if (
-            pcView.connectionState === "failed" ||
-            pcView.connectionState === "closed"
-          ) {
-            broadcastPeers.delete(viewerId);
+        function stop() {
+          for (const [, pcView] of broadcastPeers) {
+            try {
+              pcView.close();
+            } catch {}
           }
-          updateStats();
-        };
+          broadcastPeers.clear();
+          if (broadcastWs && broadcastWs.readyState === WebSocket.OPEN) {
+            broadcastWs.close(1000, "broadcast stop");
+          }
+          broadcastWs = null;
+          state.wsState = "disconnected";
+          updateState();
+        }
 
-        return pcView;
+        function getState() {
+          updateState();
+          return { ...state };
+        }
+
+        return { start, stop, getState };
+      }
+
+      function handleSensorPacket(buf) {
+        if (!(buf instanceof ArrayBuffer) || buf.byteLength !== 40) return;
+        const p = parse40(buf);
+
+        lastSeq = p.seq;
+        lastT = p.t;
+        lastPos = [p.px, p.py, p.pz];
+        lastQuat = [p.qx, p.qy, p.qz, p.qw];
+
+        rxCount++;
+        const now = performance.now();
+        const dt = now - rxWindowStart;
+        if (dt >= 500) {
+          lastRxHz = (rxCount * 1000) / dt;
+          rxCount = 0;
+          rxWindowStart = now;
+        }
+
+        const px = p.px;
+        const py = p.py;
+        const pz = p.pz;
+        const qx = p.qx;
+        const qy = p.qy;
+        const qz = p.qz;
+        const qw = p.qw;
+        lastSample = { px, py, pz, qx, qy, qz, qw };
+
+        poseObject.position.set(
+          basePos.x + (px - zeroPos.x) * posScale,
+          basePos.y + (py - zeroPos.y) * posScale,
+          basePos.z + (pz - zeroPos.z) * posScale,
+        );
+        const deviceQuat = new THREE.Quaternion(qx, qy, qz, qw);
+        poseObject.quaternion.copy(deviceQuat).multiply(modelCorrection);
+      }
+
+      let broadcastStream = null;
+      function ensureBroadcastStream() {
+        if (broadcastStream) return broadcastStream;
+        if (!renderer.domElement.captureStream) return null;
+        broadcastStream = renderer.domElement.captureStream(12);
+        return broadcastStream;
+      }
+
+      const sensorLink = createSensorLink({
+        roomId: () =>
+          (roomInputSensor && roomInputSensor.value.trim()) || "imu-data",
+        onPacket: handleSensorPacket,
+      });
+
+      const broadcastLink = createBroadcastLink({
+        roomId: () =>
+          (roomInputView && roomInputView.value.trim()) || "imu-view",
+        getStream: ensureBroadcastStream,
+      });
+
+      function startSensor() {
+        rxCount = 0;
+        rxWindowStart = performance.now();
+        sensorLink.start();
       }
 
       function stopBroadcast() {
-        for (const [, pcView] of broadcastPeers) {
-          try {
-            pcView.close();
-          } catch {}
-        }
-        broadcastPeers.clear();
-        if (broadcastWs && broadcastWs.readyState === WebSocket.OPEN) {
-          broadcastWs.close(1000, "broadcast stop");
-        }
-        broadcastWs = null;
-        broadcastWsState = "disconnected";
+        broadcastLink.stop();
         sbsEnabled = false;
-        updateStats();
       }
 
-      async function start() {
-        roomId = (roomInput && roomInput.value.trim()) || "imu";
-        localIceLines = [];
-        if (iceOut) iceOut.value = "";
-        if (offerOut) offerOut.value = "";
-        statsEl.textContent = "starting...";
-        rxCount = 0;
-        rxWindowStart = performance.now();
-
-        pc = new RTCPeerConnection({
-          iceServers: [
-            { urls: "stun:3.37.140.87:3478" },
-            {
-              urls: [
-                "turn:3.37.140.87:3478?transport=udp",
-                "turn:3.37.140.87:3478?transport=tcp",
-              ],
-              username: "imuuser",
-              credential: "imupass",
-            },
-          ],
-        });
-
-        pc.onicecandidate = (e) => {
-          if (!e.candidate) return;
-          const obj = {
-            candidate: e.candidate.candidate,
-            sdpMLineIndex: e.candidate.sdpMLineIndex,
-            sdpMid: e.candidate.sdpMid,
-          };
-          localIceLines.push(JSON.stringify(obj));
-          if (iceOut) iceOut.value = localIceLines.join("\n");
-          sendSignal({ type: "ice", candidate: obj });
-        };
-
-        pc.oniceconnectionstatechange = () => updateStats();
-        pc.onconnectionstatechange = () => updateStats();
-
-        // Offerer creates DataChannel
-        dc = pc.createDataChannel("imu", { ordered: true, maxRetransmits: 0 });
-        dc.binaryType = "arraybuffer";
-
-        dc.onopen = () => updateStats();
-        dc.onclose = () => updateStats();
-
-        dc.onmessage = async (e) => {
-          const buf =
-            e.data instanceof ArrayBuffer ? e.data : await e.data.arrayBuffer();
-          if (buf.byteLength !== 40) return;
-
-          const p = parse40(buf);
-
-          lastSeq = p.seq;
-          lastT = p.t;
-          lastPos = [p.px, p.py, p.pz];
-          lastQuat = [p.qx, p.qy, p.qz, p.qw];
-
-          // rx Hz 계산
-          rxCount++;
-          const now = performance.now();
-          const dt = now - rxWindowStart;
-          if (dt >= 500) {
-            lastRxHz = (rxCount * 1000) / dt;
-            rxCount = 0;
-            rxWindowStart = now;
-          }
-
-          // ✅ 회전/위치 적용 (ARKit -> Three.js)
-          // ARKit: right-handed, +Z forward. Three.js: right-handed, camera looks -Z.
-          const px = p.px;
-          const py = p.py;
-          const pz = p.pz;
-          const qx = p.qx;
-          const qy = p.qy;
-          const qz = p.qz;
-          const qw = p.qw;
-          lastSample = { px, py, pz, qx, qy, qz, qw };
-
-          poseObject.position.set(
-            basePos.x + (px - zeroPos.x) * posScale,
-            basePos.y + (py - zeroPos.y) * posScale,
-            basePos.z + (pz - zeroPos.z) * posScale,
-          );
-          const deviceQuat = new THREE.Quaternion(qx, qy, qz, qw);
-          poseObject.quaternion.copy(deviceQuat).multiply(modelCorrection);
-        };
-
-        connectSignaling();
-        updateStats();
-      }
-
-      async function createOffer() {
-        if (!pc) return;
-        connectSignaling();
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        lastOfferSdp = pc.localDescription.sdp;
-        if (offerOut) offerOut.value = lastOfferSdp;
-        sendSignal({ type: "offer", sdp: lastOfferSdp });
-        updateStats();
-      }
-
-      async function setRemoteAnswerSdp(rawSdp) {
-        if (!pc || !rawSdp) return;
-        let sdp = rawSdp.trim();
-        // Normalize CRLF and strip unsupported line for Chrome parsing.
-        sdp = sdp
-          .replace(/\r\n/g, "\n")
-          .replace(/\n/g, "\r\n")
-          .replace(/^a=max-message-size:.*(?:\r\n|\r|\n)?/gm, "")
-          .replace(/^a=setup:actpass\r\n?$/gm, "a=setup:active\r\n");
-        await pc.setRemoteDescription({ type: "answer", sdp });
-        updateStats();
-      }
-
-      document.getElementById("btnStart").onclick = start;
+      document.getElementById("btnStart").onclick = startSensor;
       btnCalibrate.onclick = () => {
         if (!lastSample) return;
         zeroPos = {
@@ -624,28 +748,19 @@
         };
       };
       btnBroadcast.onclick = () => {
-        if (broadcastWsState === "open" || broadcastWsState === "connecting") {
+        const state = broadcastLink.getState();
+        if (state.wsState === "open" || state.wsState === "connecting") {
           stopBroadcast();
           btnBroadcast.textContent = "Start Broadcast";
           return;
         }
-        roomId = (roomInput && roomInput.value.trim()) || "imu";
         sbsEnabled = true;
-        connectBroadcastSignaling();
+        broadcastLink.start();
         btnBroadcast.textContent = "Stop Broadcast";
       };
       window.addEventListener("beforeunload", () => {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.close(1000, "page unload");
-        }
-        if (broadcastWs && broadcastWs.readyState === WebSocket.OPEN) {
-          broadcastWs.close(1000, "page unload");
-        }
-        for (const [, pcView] of broadcastPeers) {
-          try {
-            pcView.close();
-          } catch {}
-        }
+        sensorLink.stop();
+        broadcastLink.stop();
       });
     </script>
   </body>
