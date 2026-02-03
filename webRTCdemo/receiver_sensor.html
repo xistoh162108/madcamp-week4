@@ -84,6 +84,15 @@
       renderer.setSize(window.innerWidth, window.innerHeight);
       document.body.appendChild(renderer.domElement);
 
+      const bcastCanvas = document.createElement("canvas");
+      bcastCanvas.style.display = "none";
+      document.body.appendChild(bcastCanvas);
+      const bcastRenderer = new THREE.WebGLRenderer({
+        antialias: true,
+        canvas: bcastCanvas,
+      });
+      bcastRenderer.setSize(window.innerWidth, window.innerHeight);
+
       const scene = new THREE.Scene();
       const camera = new THREE.PerspectiveCamera(
         60,
@@ -92,9 +101,20 @@
         100,
       );
       camera.position.set(0, 1.2, 3);
+      camera.rotation.order = "YXZ";
+      const degToRad = Math.PI / 180;
+      let sensorOri = { alpha: 0, beta: 0, gamma: 0 };
+      let sensorHasOri = false;
+      let lastOriUpdate = 0;
+      const oriEuler = new THREE.Euler(0, 0, 0, "YXZ");
+      const q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
+      const q0 = new THREE.Quaternion();
+      const zee = new THREE.Vector3(0, 0, 1);
+      const screenOffset = -Math.PI / 2;
       const stereo = new THREE.StereoCamera();
       stereo.eyeSep = 0.064;
       let sbsEnabled = false;
+      let bcastSbsEnabled = false;
 
       scene.add(new THREE.HemisphereLight(undefined, undefined, 1.0));
       const dir = new THREE.DirectionalLight(undefined, 1.0);
@@ -137,33 +157,57 @@
         camera.aspect = window.innerWidth / window.innerHeight;
         camera.updateProjectionMatrix();
         renderer.setSize(window.innerWidth, window.innerHeight);
+        bcastRenderer.setSize(window.innerWidth, window.innerHeight);
       });
 
-      function renderSbs() {
-        const size = renderer.getSize(new THREE.Vector2());
+      function renderSbs(targetRenderer) {
+        const size = targetRenderer.getSize(new THREE.Vector2());
         const w = size.x;
         const h = size.y;
         const halfW = Math.floor(w / 2);
 
         stereo.update(camera);
-        renderer.setScissorTest(true);
+        targetRenderer.setScissorTest(true);
 
-        renderer.setViewport(0, 0, halfW, h);
-        renderer.setScissor(0, 0, halfW, h);
-        renderer.render(scene, stereo.cameraL);
+        targetRenderer.setViewport(0, 0, halfW, h);
+        targetRenderer.setScissor(0, 0, halfW, h);
+        targetRenderer.render(scene, stereo.cameraL);
 
-        renderer.setViewport(halfW, 0, w - halfW, h);
-        renderer.setScissor(halfW, 0, w - halfW, h);
-        renderer.render(scene, stereo.cameraR);
+        targetRenderer.setViewport(halfW, 0, w - halfW, h);
+        targetRenderer.setScissor(halfW, 0, w - halfW, h);
+        targetRenderer.render(scene, stereo.cameraR);
 
-        renderer.setScissorTest(false);
+        targetRenderer.setScissorTest(false);
       }
 
       function animate() {
+        if (sensorHasOri) {
+          const beta = sensorOri.beta * degToRad;
+          const alpha = sensorOri.alpha * degToRad;
+          const gamma = sensorOri.gamma * degToRad;
+          oriEuler.set(beta, alpha, -gamma);
+          camera.quaternion.setFromEuler(oriEuler);
+          camera.quaternion.multiply(q1);
+          camera.quaternion.multiply(q0.setFromAxisAngle(zee, screenOffset));
+          camera.quaternion.normalize();
+          camera.updateMatrixWorld(true);
+          if (performance.now() - lastOriUpdate < 500) {
+            console.log(
+              "[cam]",
+              "rot",
+              camera.rotation.x.toFixed(3),
+              camera.rotation.y.toFixed(3),
+              camera.rotation.z.toFixed(3),
+            );
+          }
+        }
         if (sbsEnabled) {
-          renderSbs();
+          renderSbs(renderer);
         } else {
           renderer.render(scene, camera);
+        }
+        if (bcastSbsEnabled) {
+          renderSbs(bcastRenderer);
         }
         requestAnimationFrame(animate);
       }
@@ -179,6 +223,8 @@
       const roomInputView = document.getElementById("roomIdView");
       const btnCalibrate = document.getElementById("btnCalibrate");
       const btnBroadcast = document.getElementById("btnBroadcast");
+
+      const broadcastFPS = 30;
 
       const signalingUrl = "wss://eokbba.shop";
       const clientId =
@@ -223,6 +269,18 @@
         const qw = dv.getFloat32(36, true);
 
         return { seq, t, px, py, pz, qx, qy, qz, qw };
+      }
+
+      function parse28(buf) {
+        const dv = new DataView(buf);
+        const seq = dv.getUint32(0, true);
+        const alpha = dv.getFloat32(4, true);
+        const beta = dv.getFloat32(8, true);
+        const gamma = dv.getFloat32(12, true);
+        const ax = dv.getFloat32(16, true);
+        const ay = dv.getFloat32(20, true);
+        const az = dv.getFloat32(24, true);
+        return { seq, alpha, beta, gamma, ax, ay, az };
       }
 
       function updateStats() {
@@ -521,6 +579,73 @@
             if (track) pcView.addTrack(track, stream);
           }
 
+          const sensorDc = pcView.createDataChannel("sensor", {
+            ordered: false,
+            maxRetransmits: 0,
+          });
+          sensorDc.binaryType = "arraybuffer";
+          sensorDc.onopen = () => {
+            console.log("[sensor dc] open", viewerId);
+          };
+          sensorDc.onclose = () => {
+            console.log("[sensor dc] closed", viewerId);
+          };
+          sensorDc.onerror = (e) => {
+            console.log("[sensor dc] error", viewerId, e);
+          };
+          sensorDc.onmessage = async (e) => {
+            let buf = e.data;
+            if (!(buf instanceof ArrayBuffer)) {
+              buf = await e.data.arrayBuffer();
+            }
+            if (buf.byteLength !== 28) {
+              console.log("[sensor]", viewerId, "len", buf.byteLength);
+              return;
+            }
+            const p = parse28(buf);
+            sensorOri = { alpha: p.alpha, beta: p.beta, gamma: p.gamma };
+            sensorHasOri = true;
+            lastOriUpdate = performance.now();
+            console.log(
+              "[ori]",
+              p.alpha.toFixed(2),
+              p.beta.toFixed(2),
+              p.gamma.toFixed(2),
+            );
+            console.log(
+              "[sensor]",
+              viewerId,
+              "seq",
+              p.seq,
+              "ori",
+              p.alpha.toFixed(2),
+              p.beta.toFixed(2),
+              p.gamma.toFixed(2),
+              "acc",
+              p.ax.toFixed(2),
+              p.ay.toFixed(2),
+              p.az.toFixed(2),
+            );
+          };
+
+          pcView.ondatachannel = (e) => {
+            const ch = e.channel;
+            ch.binaryType = "arraybuffer";
+            console.log("[datachannel] recv", viewerId, ch.label);
+            ch.onopen = () =>
+              console.log("[datachannel] open", viewerId, ch.label);
+            ch.onclose = () =>
+              console.log("[datachannel] close", viewerId, ch.label);
+            ch.onmessage = (ev) => {
+              console.log(
+                "[datachannel] msg",
+                viewerId,
+                ch.label,
+                ev.data && ev.data.byteLength ? ev.data.byteLength : ev.data,
+              );
+            };
+          };
+
           pcView.onicecandidate = (e) => {
             if (!e.candidate) return;
             const obj = {
@@ -710,8 +835,8 @@
       let broadcastStream = null;
       function ensureBroadcastStream() {
         if (broadcastStream) return broadcastStream;
-        if (!renderer.domElement.captureStream) return null;
-        broadcastStream = renderer.domElement.captureStream(12);
+        if (!bcastRenderer.domElement.captureStream) return null;
+        broadcastStream = bcastRenderer.domElement.captureStream(broadcastFPS);
         return broadcastStream;
       }
 
@@ -735,7 +860,7 @@
 
       function stopBroadcast() {
         broadcastLink.stop();
-        sbsEnabled = false;
+        bcastSbsEnabled = false;
       }
 
       document.getElementById("btnStart").onclick = startSensor;
@@ -754,7 +879,7 @@
           btnBroadcast.textContent = "Start Broadcast";
           return;
         }
-        sbsEnabled = true;
+        bcastSbsEnabled = true;
         broadcastLink.start();
         btnBroadcast.textContent = "Stop Broadcast";
       };

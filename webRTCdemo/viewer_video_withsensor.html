@@ -55,7 +55,7 @@
   </head>
   <body>
     <div id="ui">
-      <input id="roomId" value="imu" />
+      <input id="roomId" value="imu-view" />
       <button id="btnJoin">Join Broadcast</button>
       <button id="btnSensor">Enable Sensors</button>
       <div id="status">idle</div>
@@ -71,7 +71,7 @@
       var videoEl = document.getElementById("video");
       statusEl.textContent = "js loaded";
 
-      var signalingUrl = "ws://3.37.140.87:8080";
+      var signalingUrl = "wss://eokbba.shop";
       var clientId =
         (window.crypto && window.crypto.randomUUID && window.crypto.randomUUID()) ||
         Math.random().toString(36).slice(2);

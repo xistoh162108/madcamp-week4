@@ -26,16 +26,22 @@
         border-radius: 10px;
         width: 240px;
       }
+      #controls {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
       #ui.min {
         opacity: 0.2;
       }
       #ui.min {
         pointer-events: none;
       }
-      #ui.min #btnFull {
+      #ui.min #btnFull,
+      #ui.min #btnSensor {
         pointer-events: auto;
       }
-      #ui.min button:not(#btnFull),
+      #ui.min button:not(#btnFull):not(#btnSensor),
       #ui.min input {
         display: none;
       }
@@ -43,11 +49,13 @@
         width: 100%;
         padding: 6px 8px;
         box-sizing: border-box;
+        font-size: 48px;
       }
       button {
         padding: 6px 10px;
         margin-top: 8px;
         width: 100%;
+        font-size: 48px;
       }
       #status {
         font-size: 12px;
@@ -73,13 +81,29 @@
       body.fullscreen video {
         object-fit: contain;
       }
+      @media (orientation: portrait) {
+        #ui {
+          width: calc(100% - 24px);
+        }
+        #controls button {
+          margin-top: 0;
+          padding: 12px 0;
+          font-size: 48px;
+        }
+        #status {
+          display: none;
+        }
+      }
     </style>
   </head>
   <body>
     <div id="ui">
       <input id="roomId" value="imu-view" />
-      <button id="btnJoin">Join Broadcast</button>
-      <button id="btnFull">Fullscreen</button>
+      <div id="controls">
+        <button id="btnJoin">Join Broadcast</button>
+        <button id="btnSensor">Enable Sensors</button>
+        <button id="btnFull">Fullscreen</button>
+      </div>
       <div id="status">idle v2</div>
     </div>
 
@@ -88,6 +112,7 @@
     <script>
       var roomInput = document.getElementById("roomId");
       var btnJoin = document.getElementById("btnJoin");
+      var btnSensor = document.getElementById("btnSensor");
       var statusEl = document.getElementById("status");
       var videoEl = document.getElementById("video");
       var btnFull = document.getElementById("btnFull");
@@ -101,6 +126,7 @@
       var ws = null;
       var wsState = "disconnected";
       var pc = null;
+      var dc = null;
       var roomId = "imu";
       var broadcasterId = null;
       var hasOffer = false;
@@ -109,6 +135,15 @@
       var lastMsg = "";
 
       var eventLog = [];
+      var sensorEnabled = false;
+      var sensorSeq = 0;
+      var lastSendTs = 0;
+      var sendIntervalMs = 33;
+      var ori = { alpha: 0, beta: 0, gamma: 0 };
+      var acc = { x: 0, y: 0, z: 0 };
+      var sensorPump = null;
+      var lastSensorEventTs = 0;
+      var lastSensorWarnTs = 0;
 
       function pushLog(line) {
         eventLog.push(line);
@@ -120,6 +155,8 @@
       function updateStatus(extra) {
         var pcState = "none";
         var iceState = "none";
+        var dcState = dc ? dc.readyState : "none";
+        var secureState = window.isSecureContext ? "true" : "false";
         if (pc) {
           pcState = pc.connectionState || pc.iceConnectionState || "unknown";
           iceState = pc.iceConnectionState || "unknown";
@@ -128,9 +165,12 @@
           "ws: " + wsState +
           "\npc: " + pcState +
           "\nice: " + iceState +
+          "\ndc: " + dcState +
           "\nmsg: " + msgCount +
+          "\nsecure: " + secureState +
           (lastMsg ? "\nlast: " + lastMsg : "") +
-          (eventLog.length ? "\nlog:\n" + eventLog.join("\n") : "");
+          (eventLog.length ? "\nlog:\n" + eventLog.join("\n") : "") +
+          "\nsensor: " + (sensorEnabled ? "on" : "off");
         if (extra) {
           statusEl.textContent += "\n" + extra;
         }
@@ -488,6 +528,26 @@
           }
         };
 
+        pc.ondatachannel = function (e) {
+          dc = e.channel;
+          dc.binaryType = "arraybuffer";
+          dc.onopen = function () {
+            pushLog("dc open");
+            updateStatus("dc open");
+            try {
+              dc.send(new Uint8Array([1]).buffer);
+            } catch (err) {}
+          };
+          dc.onclose = function () {
+            pushLog("dc closed");
+            updateStatus("dc closed");
+          };
+          dc.onerror = function () {
+            pushLog("dc error");
+            updateStatus("dc error");
+          };
+        };
+
         pc.onconnectionstatechange = function () {
           updateStatus();
         };
@@ -500,6 +560,72 @@
 
       function createLocalOffer() {
         ensurePeer();
+      }
+
+      function packSensorPayload() {
+        var buf = new ArrayBuffer(28);
+        var dv = new DataView(buf);
+        dv.setUint32(0, sensorSeq, true);
+        dv.setFloat32(4, ori.alpha || 0, true);
+        dv.setFloat32(8, ori.beta || 0, true);
+        dv.setFloat32(12, ori.gamma || 0, true);
+        dv.setFloat32(16, acc.x || 0, true);
+        dv.setFloat32(20, acc.y || 0, true);
+        dv.setFloat32(24, acc.z || 0, true);
+        return buf;
+      }
+
+      function maybeSendSensor(now) {
+        if (!sensorEnabled) return;
+        if (!dc || dc.readyState !== "open") return;
+        if (now - lastSendTs < sendIntervalMs) return;
+        if (now - lastSensorEventTs > 1000) {
+          if (now - lastSensorWarnTs > 1000) {
+            lastSensorWarnTs = now;
+            updateStatus("sensor blocked?");
+          }
+          return;
+        }
+        lastSendTs = now;
+        sensorSeq = (sensorSeq + 1) >>> 0;
+        try {
+          dc.send(packSensorPayload());
+        } catch (e) {}
+      }
+
+      function onOrientation(e) {
+        ori.alpha = e.alpha || 0;
+        ori.beta = e.beta || 0;
+        ori.gamma = e.gamma || 0;
+        lastSensorEventTs = performance.now();
+        maybeSendSensor(performance.now());
+      }
+
+      function onMotion(e) {
+        if (e.accelerationIncludingGravity) {
+          acc.x = e.accelerationIncludingGravity.x || 0;
+          acc.y = e.accelerationIncludingGravity.y || 0;
+          acc.z = e.accelerationIncludingGravity.z || 0;
+        } else if (e.acceleration) {
+          acc.x = e.acceleration.x || 0;
+          acc.y = e.acceleration.y || 0;
+          acc.z = e.acceleration.z || 0;
+        }
+        lastSensorEventTs = performance.now();
+        maybeSendSensor(performance.now());
+      }
+
+      function enableSensors() {
+        if (sensorEnabled) return;
+        sensorEnabled = true;
+        updateStatus("sensor enabled");
+        window.addEventListener("deviceorientation", onOrientation, true);
+        window.addEventListener("devicemotion", onMotion, true);
+        if (!sensorPump) {
+          sensorPump = setInterval(function () {
+            maybeSendSensor(performance.now());
+          }, sendIntervalMs);
+        }
       }
 
       function joinBroadcast() {
@@ -526,6 +652,27 @@
       btnJoin.ontouchstart = function (e) {
         e.preventDefault();
         joinBroadcast();
+      };
+
+      btnSensor.onclick = function () {
+        if (
+          typeof DeviceMotionEvent !== "undefined" &&
+          typeof DeviceMotionEvent.requestPermission === "function"
+        ) {
+          DeviceMotionEvent.requestPermission()
+            .then(function (state) {
+              if (state === "granted") {
+                enableSensors();
+              } else {
+                updateStatus("sensor denied");
+              }
+            })
+            .catch(function () {
+              updateStatus("sensor denied");
+            });
+        } else {
+          enableSensors();
+        }
       };
 
       function requestFullscreen() {
@@ -563,13 +710,25 @@
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.close(1000, "page unload");
         }
+        if (dc) {
+          try {
+            dc.close();
+          } catch (e) {}
+        }
         if (pc) {
           try {
             pc.close();
           } catch (e) {}
         }
+        if (sensorPump) {
+          clearInterval(sensorPump);
+          sensorPump = null;
+        }
+        window.removeEventListener("deviceorientation", onOrientation, true);
+        window.removeEventListener("devicemotion", onMotion, true);
       });
 
+      updateStatus();
       updateStatus();
     </script>
   </body>

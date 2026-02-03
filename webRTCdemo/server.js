@@ -1,7 +1,26 @@
+const fs = require("fs");
+const https = require("https");
 const WebSocket = require("ws");
 const WebSocketServer = WebSocket.Server;
 
-const wss = new WebSocketServer({ port: 8080 });
+const keyPath = process.env.TLS_KEY;
+const certPath = process.env.TLS_CERT;
+
+if (!keyPath || !certPath) {
+  console.error("Missing TLS_KEY/TLS_CERT env vars for WSS.");
+  process.exit(1);
+}
+
+const tlsOptions = {
+  key: fs.readFileSync(keyPath),
+  cert: fs.readFileSync(certPath),
+};
+
+const server = https.createServer(tlsOptions, (req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("ok");
+});
+const wss = new WebSocketServer({ server });
 
 // roomId -> Set<ws>
 const rooms = new Map();
@@ -79,4 +98,6 @@ wss.on("connection", (ws) => {
   });
 });
 
-console.log("signaling on ws://0.0.0.0:8080");
+server.listen(443, "0.0.0.0", () => {
+  console.log("signaling on wss://0.0.0.0:443");
+});
