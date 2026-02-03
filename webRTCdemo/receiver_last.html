@@ -1,0 +1,892 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>WebRTC IMU Receiver + Three.js</title>
+    <style>
+      body {
+        margin: 0;
+        font-family:
+          system-ui,
+          -apple-system,
+          sans-serif;
+      }
+      #ui {
+        position: fixed;
+        left: 12px;
+        top: 12px;
+        z-index: 10;
+        background: rgba(255, 255, 255, 0.92);
+        padding: 10px;
+        border-radius: 10px;
+        width: 420px;
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+      }
+      #ui input {
+        width: 100%;
+        padding: 6px 8px;
+        box-sizing: border-box;
+      }
+      textarea {
+        width: 100%;
+        height: 90px;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin: 6px 0;
+      }
+      button {
+        padding: 6px 10px;
+      }
+      #stats {
+        font-size: 12px;
+        white-space: pre;
+        background: #f6f6f6;
+        padding: 8px;
+        border-radius: 8px;
+      }
+      canvas {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="ui">
+      <div class="row">
+        <input id="roomIdSensor" value="imu-data" />
+        <input id="roomIdView" value="imu-view" />
+      </div>
+      <div class="row">
+        <button id="btnStart">Start</button>
+        <button id="btnCalibrate">Zero (1-shot)</button>
+        <button id="btnBroadcast">Start Broadcast</button>
+      </div>
+
+      <div id="stats">waiting...</div>
+    </div>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+        }
+      }
+    </script>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { GLTFLoader } from "https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+
+      // ---------- Three.js scene ----------
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.body.appendChild(renderer.domElement);
+
+      const bcastCanvas = document.createElement("canvas");
+      bcastCanvas.style.display = "none";
+      document.body.appendChild(bcastCanvas);
+      const bcastRenderer = new THREE.WebGLRenderer({
+        antialias: true,
+        canvas: bcastCanvas,
+      });
+      bcastRenderer.setSize(window.innerWidth, window.innerHeight);
+
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(
+        60,
+        window.innerWidth / window.innerHeight,
+        0.01,
+        100,
+      );
+      camera.position.set(0, 1.2, 3);
+      camera.rotation.order = "YXZ";
+      const degToRad = Math.PI / 180;
+      let sensorOri = { alpha: 0, beta: 0, gamma: 0 };
+      let sensorHasOri = false;
+      let lastOriUpdate = 0;
+      const oriEuler = new THREE.Euler(0, 0, 0, "YXZ");
+      const q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
+      const q0 = new THREE.Quaternion();
+      const zee = new THREE.Vector3(0, 0, 1);
+      const screenOffset = -Math.PI / 2;
+      const stereo = new THREE.StereoCamera();
+      stereo.eyeSep = 0.064;
+      let sbsEnabled = false;
+      let bcastSbsEnabled = false;
+
+      scene.add(new THREE.HemisphereLight(undefined, undefined, 1.0));
+      const dir = new THREE.DirectionalLight(undefined, 1.0);
+      dir.position.set(3, 4, 2);
+      scene.add(dir);
+
+      const grid = new THREE.GridHelper(6, 12);
+      scene.add(grid);
+      const axes = new THREE.AxesHelper(1.2);
+      scene.add(axes);
+
+      // Placeholder cylinder (axis = Y)
+      const cyl = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.2, 0.2, 1.2, 24),
+        new THREE.MeshStandardMaterial(),
+      );
+      cyl.position.set(0, 0.6, 0);
+      scene.add(cyl);
+      let poseObject = cyl;
+
+      // Load lightsaber model
+      const loader = new GLTFLoader();
+      loader.load(
+        "./lightsaber1.glb",
+        (gltf) => {
+          const model = gltf.scene;
+          model.position.set(0, 0.6, 0);
+          model.scale.set(1, 1, 1);
+          scene.add(model);
+          poseObject = model;
+          cyl.visible = false;
+        },
+        undefined,
+        (err) => {
+          console.error("Failed to load lightsaber model", err);
+        },
+      );
+
+      window.addEventListener("resize", () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        bcastRenderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      function renderSbs(targetRenderer) {
+        const size = targetRenderer.getSize(new THREE.Vector2());
+        const w = size.x;
+        const h = size.y;
+        const halfW = Math.floor(w / 2);
+
+        stereo.update(camera);
+        targetRenderer.setScissorTest(true);
+
+        targetRenderer.setViewport(0, 0, halfW, h);
+        targetRenderer.setScissor(0, 0, halfW, h);
+        targetRenderer.render(scene, stereo.cameraL);
+
+        targetRenderer.setViewport(halfW, 0, w - halfW, h);
+        targetRenderer.setScissor(halfW, 0, w - halfW, h);
+        targetRenderer.render(scene, stereo.cameraR);
+
+        targetRenderer.setScissorTest(false);
+      }
+
+      function animate() {
+        if (sensorHasOri) {
+          const beta = sensorOri.beta * degToRad;
+          const alpha = sensorOri.alpha * degToRad;
+          const gamma = sensorOri.gamma * degToRad;
+          oriEuler.set(beta, alpha, -gamma);
+          camera.quaternion.setFromEuler(oriEuler);
+          camera.quaternion.multiply(q1);
+          camera.quaternion.multiply(q0.setFromAxisAngle(zee, screenOffset));
+          camera.quaternion.normalize();
+          camera.updateMatrixWorld(true);
+          if (performance.now() - lastOriUpdate < 500) {
+            console.log(
+              "[cam]",
+              "rot",
+              camera.rotation.x.toFixed(3),
+              camera.rotation.y.toFixed(3),
+              camera.rotation.z.toFixed(3),
+            );
+          }
+        }
+        if (sbsEnabled) {
+          renderSbs(renderer);
+        } else {
+          renderer.render(scene, camera);
+        }
+        if (bcastSbsEnabled) {
+          renderSbs(bcastRenderer);
+        }
+        requestAnimationFrame(animate);
+      }
+      animate();
+
+      // ---------- WebRTC / UI ----------
+      const offerOut = null;
+      const answerIn = null;
+      const iceOut = null;
+      const iceIn = null;
+      const statsEl = document.getElementById("stats");
+      const roomInputSensor = document.getElementById("roomIdSensor");
+      const roomInputView = document.getElementById("roomIdView");
+      const btnCalibrate = document.getElementById("btnCalibrate");
+      const btnBroadcast = document.getElementById("btnBroadcast");
+
+      const broadcastFPS = 30;
+
+      const signalingUrl = "wss://eokbba.shop";
+      const clientId =
+        (crypto && crypto.randomUUID && crypto.randomUUID()) ||
+        Math.random().toString(36).slice(2);
+
+      // ---------- AR pose packet parsing (40 bytes) ----------
+      // Layout:
+      // u32 seq (LE) @0
+      // f64 t (LE)  @4
+      // f32 px,py,pz (LE) @12
+      // f32 qx,qy,qz,qw (LE) @24
+      let lastSeq = 0;
+      let lastT = 0;
+      let lastPos = [0, 0, 0];
+      let lastQuat = [0, 0, 0, 1];
+      let lastRxHz = 0;
+      const basePos = { x: 0, y: 0, z: 0 };
+      const posScale = 1.0;
+
+      const modelCorrection = new THREE.Quaternion().setFromEuler(
+        new THREE.Euler(0, -Math.PI / 2, 0),
+      );
+      let zeroPos = { x: 0, y: 0, z: 0 };
+      let lastSample = null;
+
+      let rxCount = 0;
+      let rxWindowStart = performance.now();
+
+      function parse40(buf) {
+        const dv = new DataView(buf);
+        const seq = dv.getUint32(0, true);
+        const t = dv.getFloat64(4, true);
+
+        const px = dv.getFloat32(12, true);
+        const py = dv.getFloat32(16, true);
+        const pz = dv.getFloat32(20, true);
+
+        const qx = dv.getFloat32(24, true);
+        const qy = dv.getFloat32(28, true);
+        const qz = dv.getFloat32(32, true);
+        const qw = dv.getFloat32(36, true);
+
+        return { seq, t, px, py, pz, qx, qy, qz, qw };
+      }
+
+      function parse28(buf) {
+        const dv = new DataView(buf);
+        const seq = dv.getUint32(0, true);
+        const alpha = dv.getFloat32(4, true);
+        const beta = dv.getFloat32(8, true);
+        const gamma = dv.getFloat32(12, true);
+        const ax = dv.getFloat32(16, true);
+        const ay = dv.getFloat32(20, true);
+        const az = dv.getFloat32(24, true);
+        return { seq, alpha, beta, gamma, ax, ay, az };
+      }
+
+      function updateStats() {
+        const sensor = sensorLink.getState();
+        const bcast = broadcastLink.getState();
+        statsEl.textContent = `pc: ${sensor.pcState} / ice: ${sensor.iceState}
+          dc: ${sensor.dcState}
+          ws: ${sensor.wsState}
+          broadcast: ${bcast.wsState} / viewers: ${bcast.viewers}
+          bcast: ${bcast.lastEvent}
+          rxHz: ${lastRxHz.toFixed(1)}
+          seq: ${lastSeq}
+          t: ${lastT.toFixed(3)}
+          pos(xyz):  ${lastPos.map((v) => v.toFixed(3)).join(", ")}
+          quat(xyzw): ${lastQuat.map((v) => v.toFixed(3)).join(", ")}`;
+      }
+      setInterval(updateStats, 200);
+
+      function createSensorLink(opts) {
+        const roomId = opts.roomId;
+        const onPacket = opts.onPacket;
+        const state = {
+          wsState: "disconnected",
+          pcState: "none",
+          iceState: "none",
+          dcState: "none",
+        };
+
+        let pc = null;
+        let dc = null;
+        let ws = null;
+        let lastOfferSdp = "";
+        let localIceLines = [];
+
+        function updateState() {
+          state.pcState = pc ? pc.connectionState || "unknown" : "none";
+          state.iceState = pc ? pc.iceConnectionState || "unknown" : "none";
+          state.dcState = dc ? dc.readyState || "unknown" : "none";
+        }
+
+        function sendSignal(payload) {
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          ws.send(
+            JSON.stringify({ sender: clientId, room: roomId(), ...payload }),
+          );
+        }
+
+        function connectSignaling() {
+          if (
+            ws &&
+            (ws.readyState === WebSocket.OPEN ||
+              ws.readyState === WebSocket.CONNECTING)
+          ) {
+            return;
+          }
+          ws = new WebSocket(signalingUrl);
+          state.wsState = "connecting";
+          updateState();
+
+          ws.onopen = () => {
+            state.wsState = "open";
+            updateState();
+            sendSignal({ type: "join" });
+            if (lastOfferSdp) {
+              sendSignal({ type: "offer", sdp: lastOfferSdp });
+            } else if (pc) {
+              createOffer();
+            }
+          };
+
+          ws.onclose = () => {
+            state.wsState = "closed";
+            updateState();
+          };
+
+          ws.onerror = () => {
+            state.wsState = "error";
+            updateState();
+          };
+
+          ws.onmessage = async (evt) => {
+            let msg = null;
+            try {
+              msg = JSON.parse(evt.data);
+            } catch {
+              return;
+            }
+            if (msg && msg.sender && msg.sender === clientId) return;
+            if (!pc) return;
+
+            if (msg.type === "answer" && msg.sdp) {
+              await setRemoteAnswerSdp(msg.sdp);
+              return;
+            }
+            if (msg.type === "ready") {
+              if (pc) createOffer();
+              return;
+            }
+            if (msg.type === "ice" && msg.candidate) {
+              try {
+                await pc.addIceCandidate(msg.candidate);
+                updateState();
+              } catch {}
+              return;
+            }
+          };
+        }
+
+        async function createOffer() {
+          if (!pc) return;
+          connectSignaling();
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          lastOfferSdp = pc.localDescription.sdp;
+          console.log("[sensor offer]", {
+            len: lastOfferSdp.length,
+            hasLf: lastOfferSdp.indexOf("\n") !== -1,
+            hasCr: lastOfferSdp.indexOf("\r") !== -1,
+            head: lastOfferSdp.split(/\r\n|\n/).slice(0, 6),
+          });
+          if (offerOut) offerOut.value = lastOfferSdp;
+          sendSignal({ type: "offer", sdp: lastOfferSdp });
+          updateState();
+        }
+
+        async function setRemoteAnswerSdp(rawSdp) {
+          if (!pc || !rawSdp) return;
+          let sdp = rawSdp.trim();
+          sdp = sdp
+            .replace(/\r\n/g, "\n")
+            .replace(/\n/g, "\r\n")
+            .replace(/^a=max-message-size:.*(?:\r\n|\r|\n)?/gm, "")
+            .replace(/^a=setup:actpass\r\n?$/gm, "a=setup:active\r\n");
+          await pc.setRemoteDescription({ type: "answer", sdp });
+          updateState();
+        }
+
+        function start() {
+          localIceLines = [];
+
+          pc = new RTCPeerConnection({
+            sdpSemantics: "plan-b",
+            iceServers: [
+              { urls: "stun:3.37.140.87:3478" },
+              {
+                urls: [
+                  "turn:3.37.140.87:3478?transport=udp",
+                  "turn:3.37.140.87:3478?transport=tcp",
+                ],
+                username: "imuuser",
+                credential: "imupass",
+              },
+            ],
+          });
+
+          pc.onicecandidate = (e) => {
+            if (!e.candidate) return;
+            const obj = {
+              candidate: e.candidate.candidate,
+              sdpMLineIndex: e.candidate.sdpMLineIndex,
+              sdpMid: e.candidate.sdpMid,
+            };
+            localIceLines.push(JSON.stringify(obj));
+            if (iceOut) iceOut.value = localIceLines.join("\n");
+            sendSignal({ type: "ice", candidate: obj });
+          };
+
+          pc.oniceconnectionstatechange = () => updateState();
+          pc.onconnectionstatechange = () => updateState();
+
+          dc = pc.createDataChannel("imu", {
+            ordered: true,
+            maxRetransmits: 0,
+          });
+          dc.binaryType = "arraybuffer";
+
+          dc.onopen = () => updateState();
+          dc.onclose = () => updateState();
+
+          dc.onmessage = async (e) => {
+            const buf =
+              e.data instanceof ArrayBuffer
+                ? e.data
+                : await e.data.arrayBuffer();
+            onPacket(buf);
+          };
+
+          connectSignaling();
+          updateState();
+        }
+
+        function stop() {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.close(1000, "page unload");
+          }
+          if (dc) {
+            try {
+              dc.close();
+            } catch {}
+          }
+          if (pc) {
+            try {
+              pc.close();
+            } catch {}
+          }
+          ws = null;
+          dc = null;
+          pc = null;
+          state.wsState = "disconnected";
+          updateState();
+        }
+
+        function getState() {
+          updateState();
+          return { ...state };
+        }
+
+        return { start, stop, getState };
+      }
+
+      function createBroadcastLink(opts) {
+        const roomId = opts.roomId;
+        const getStream = opts.getStream;
+        const state = {
+          wsState: "disconnected",
+          viewers: 0,
+          lastEvent: "",
+        };
+
+        let broadcastWs = null;
+        const broadcastPeers = new Map();
+
+        function updateState() {
+          state.viewers = broadcastPeers.size;
+        }
+
+        function sendSignal(payload) {
+          if (!broadcastWs || broadcastWs.readyState !== WebSocket.OPEN) return;
+          broadcastWs.send(
+            JSON.stringify({
+              sender: clientId + "-b",
+              room: roomId(),
+              ...payload,
+            }),
+          );
+        }
+
+        async function makeOffer(viewerId, pcView, includeTo) {
+          const offer = await pcView.createOffer();
+          await pcView.setLocalDescription(offer);
+          const payload = { type: "offer", sdp: pcView.localDescription.sdp };
+          console.log("[bcast offer]", {
+            to: viewerId || "anon",
+            len: payload.sdp.length,
+            hasLf: payload.sdp.indexOf("\n") !== -1,
+            hasCr: payload.sdp.indexOf("\r") !== -1,
+            head: payload.sdp.split(/\r\n|\n/).slice(0, 6),
+          });
+          if (includeTo && viewerId) {
+            payload.to = viewerId;
+          }
+          sendSignal(payload);
+          state.lastEvent = viewerId
+            ? `offer to ${viewerId.slice(0, 6)}`
+            : "offer to anon";
+          updateState();
+        }
+
+        function ensurePeer(viewerId) {
+          if (broadcastPeers.has(viewerId)) return broadcastPeers.get(viewerId);
+          const stream = getStream();
+          if (!stream) {
+            alert("captureStream is not supported in this browser.");
+            return null;
+          }
+          const pcView = new RTCPeerConnection({
+            sdpSemantics: "plan-b",
+            iceServers: [
+              { urls: "stun:3.37.140.87:3478" },
+              {
+                urls: [
+                  "turn:3.37.140.87:3478?transport=udp",
+                  "turn:3.37.140.87:3478?transport=tcp",
+                ],
+                username: "imuuser",
+                credential: "imupass",
+              },
+            ],
+          });
+          broadcastPeers.set(viewerId, pcView);
+
+          if (pcView.addStream) {
+            pcView.addStream(stream);
+          } else {
+            const track = stream.getVideoTracks()[0];
+            if (track) pcView.addTrack(track, stream);
+          }
+
+          const sensorDc = pcView.createDataChannel("sensor", {
+            ordered: false,
+            maxRetransmits: 0,
+          });
+          sensorDc.binaryType = "arraybuffer";
+          sensorDc.onopen = () => {
+            console.log("[sensor dc] open", viewerId);
+          };
+          sensorDc.onclose = () => {
+            console.log("[sensor dc] closed", viewerId);
+          };
+          sensorDc.onerror = (e) => {
+            console.log("[sensor dc] error", viewerId, e);
+          };
+          sensorDc.onmessage = async (e) => {
+            let buf = e.data;
+            if (!(buf instanceof ArrayBuffer)) {
+              buf = await e.data.arrayBuffer();
+            }
+            if (buf.byteLength !== 28) {
+              console.log("[sensor]", viewerId, "len", buf.byteLength);
+              return;
+            }
+            const p = parse28(buf);
+            sensorOri = { alpha: p.alpha, beta: p.beta, gamma: p.gamma };
+            sensorHasOri = true;
+            lastOriUpdate = performance.now();
+            console.log(
+              "[ori]",
+              p.alpha.toFixed(2),
+              p.beta.toFixed(2),
+              p.gamma.toFixed(2),
+            );
+            console.log(
+              "[sensor]",
+              viewerId,
+              "seq",
+              p.seq,
+              "ori",
+              p.alpha.toFixed(2),
+              p.beta.toFixed(2),
+              p.gamma.toFixed(2),
+              "acc",
+              p.ax.toFixed(2),
+              p.ay.toFixed(2),
+              p.az.toFixed(2),
+            );
+          };
+
+          pcView.ondatachannel = (e) => {
+            const ch = e.channel;
+            ch.binaryType = "arraybuffer";
+            console.log("[datachannel] recv", viewerId, ch.label);
+            ch.onopen = () =>
+              console.log("[datachannel] open", viewerId, ch.label);
+            ch.onclose = () =>
+              console.log("[datachannel] close", viewerId, ch.label);
+            ch.onmessage = (ev) => {
+              console.log(
+                "[datachannel] msg",
+                viewerId,
+                ch.label,
+                ev.data && ev.data.byteLength ? ev.data.byteLength : ev.data,
+              );
+            };
+          };
+
+          pcView.onicecandidate = (e) => {
+            if (!e.candidate) return;
+            const obj = {
+              candidate: e.candidate.candidate,
+              sdpMLineIndex: e.candidate.sdpMLineIndex,
+              sdpMid: e.candidate.sdpMid,
+            };
+            sendSignal({ type: "ice", candidate: obj, to: viewerId });
+          };
+
+          pcView.onconnectionstatechange = () => {
+            if (
+              pcView.connectionState === "failed" ||
+              pcView.connectionState === "closed"
+            ) {
+              broadcastPeers.delete(viewerId);
+            }
+            updateState();
+          };
+
+          return pcView;
+        }
+
+        function getAnyPeer() {
+          for (const [, pcView] of broadcastPeers) return pcView;
+          return null;
+        }
+
+        function connectSignaling() {
+          if (
+            broadcastWs &&
+            (broadcastWs.readyState === WebSocket.OPEN ||
+              broadcastWs.readyState === WebSocket.CONNECTING)
+          ) {
+            return;
+          }
+          broadcastWs = new WebSocket(signalingUrl);
+          state.wsState = "connecting";
+          updateState();
+
+          broadcastWs.onopen = () => {
+            state.wsState = "open";
+            updateState();
+            sendSignal({ type: "join" });
+          };
+
+          broadcastWs.onclose = () => {
+            state.wsState = "closed";
+            updateState();
+          };
+
+          broadcastWs.onerror = () => {
+            state.wsState = "error";
+            updateState();
+          };
+
+          broadcastWs.onmessage = async (evt) => {
+            let msg = null;
+            try {
+              msg = JSON.parse(evt.data);
+            } catch {
+              return;
+            }
+            if (!msg || msg.sender === clientId + "-b") return;
+            if (msg.room && msg.room !== roomId()) return;
+
+            const senderId = msg.sender || msg.viewerId || "";
+            if (
+              msg.type === "ready" ||
+              msg.type === "joined" ||
+              msg.type === "join"
+            ) {
+              if (!senderId) {
+                state.lastEvent = "ready from ?";
+                const anonId = "__anon__";
+                const pcView = ensurePeer(anonId);
+                if (pcView) {
+                  await makeOffer(null, pcView, false);
+                }
+                updateState();
+                return;
+              }
+              state.lastEvent = `ready from ${senderId.slice(0, 6)}`;
+              const pcView = ensurePeer(senderId);
+              if (pcView) {
+                await makeOffer(senderId, pcView, true);
+              }
+              updateState();
+              return;
+            }
+            if (
+              msg.type === "answer" &&
+              msg.sdp &&
+              (!msg.to || msg.to === clientId + "-b")
+            ) {
+              const pc = broadcastPeers.get(senderId) || getAnyPeer();
+              if (!pc) return;
+              await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+              state.lastEvent = senderId
+                ? `answer from ${senderId.slice(0, 6)}`
+                : "answer from ?";
+              updateState();
+              return;
+            }
+            if (
+              msg.type === "ice" &&
+              msg.candidate &&
+              (!msg.to || msg.to === clientId + "-b")
+            ) {
+              const pc = broadcastPeers.get(senderId) || getAnyPeer();
+              if (!pc) return;
+              try {
+                await pc.addIceCandidate(msg.candidate);
+              } catch {}
+              state.lastEvent = senderId
+                ? `ice from ${senderId.slice(0, 6)}`
+                : "ice from ?";
+              updateState();
+              return;
+            }
+          };
+        }
+
+        function start() {
+          connectSignaling();
+        }
+
+        function stop() {
+          for (const [, pcView] of broadcastPeers) {
+            try {
+              pcView.close();
+            } catch {}
+          }
+          broadcastPeers.clear();
+          if (broadcastWs && broadcastWs.readyState === WebSocket.OPEN) {
+            broadcastWs.close(1000, "broadcast stop");
+          }
+          broadcastWs = null;
+          state.wsState = "disconnected";
+          updateState();
+        }
+
+        function getState() {
+          updateState();
+          return { ...state };
+        }
+
+        return { start, stop, getState };
+      }
+
+      function handleSensorPacket(buf) {
+        if (!(buf instanceof ArrayBuffer) || buf.byteLength !== 40) return;
+        const p = parse40(buf);
+
+        lastSeq = p.seq;
+        lastT = p.t;
+        lastPos = [p.px, p.py, p.pz];
+        lastQuat = [p.qx, p.qy, p.qz, p.qw];
+
+        rxCount++;
+        const now = performance.now();
+        const dt = now - rxWindowStart;
+        if (dt >= 500) {
+          lastRxHz = (rxCount * 1000) / dt;
+          rxCount = 0;
+          rxWindowStart = now;
+        }
+
+        const px = p.px;
+        const py = p.py;
+        const pz = p.pz;
+        const qx = p.qx;
+        const qy = p.qy;
+        const qz = p.qz;
+        const qw = p.qw;
+        lastSample = { px, py, pz, qx, qy, qz, qw };
+
+        poseObject.position.set(
+          basePos.x + (px - zeroPos.x) * posScale,
+          basePos.y + (py - zeroPos.y) * posScale,
+          basePos.z + (pz - zeroPos.z) * posScale,
+        );
+        const deviceQuat = new THREE.Quaternion(qx, qy, qz, qw);
+        poseObject.quaternion.copy(deviceQuat).multiply(modelCorrection);
+      }
+
+      let broadcastStream = null;
+      function ensureBroadcastStream() {
+        if (broadcastStream) return broadcastStream;
+        if (!bcastRenderer.domElement.captureStream) return null;
+        broadcastStream = bcastRenderer.domElement.captureStream(broadcastFPS);
+        return broadcastStream;
+      }
+
+      const sensorLink = createSensorLink({
+        roomId: () =>
+          (roomInputSensor && roomInputSensor.value.trim()) || "imu-data",
+        onPacket: handleSensorPacket,
+      });
+
+      const broadcastLink = createBroadcastLink({
+        roomId: () =>
+          (roomInputView && roomInputView.value.trim()) || "imu-view",
+        getStream: ensureBroadcastStream,
+      });
+
+      function startSensor() {
+        rxCount = 0;
+        rxWindowStart = performance.now();
+        sensorLink.start();
+      }
+
+      function stopBroadcast() {
+        broadcastLink.stop();
+        bcastSbsEnabled = false;
+      }
+
+      document.getElementById("btnStart").onclick = startSensor;
+      btnCalibrate.onclick = () => {
+        if (!lastSample) return;
+        zeroPos = {
+          x: lastSample.px,
+          y: lastSample.py,
+          z: lastSample.pz,
+        };
+      };
+      btnBroadcast.onclick = () => {
+        const state = broadcastLink.getState();
+        if (state.wsState === "open" || state.wsState === "connecting") {
+          stopBroadcast();
+          btnBroadcast.textContent = "Start Broadcast";
+          return;
+        }
+        bcastSbsEnabled = true;
+        broadcastLink.start();
+        btnBroadcast.textContent = "Stop Broadcast";
+      };
+      window.addEventListener("beforeunload", () => {
+        sensorLink.stop();
+        broadcastLink.stop();
+      });
+    </script>
+  </body>
+</html>

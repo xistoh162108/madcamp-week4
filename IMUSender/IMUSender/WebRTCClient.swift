@@ -17,6 +17,9 @@ final class WebRTCClient: NSObject, ObservableObject {
     private var wsSession: URLSession?
     private var signalingRoom: String = "imu"
     private var signalingUrl: String = "wss://eokbba.shop"
+    private var reconnectTimer: DispatchWorkItem?
+    private var reconnectAttempts: Int = 0
+    private var isStopping: Bool = false
 
     override init() {
         RTCInitializeSSL()
@@ -53,6 +56,9 @@ final class WebRTCClient: NSObject, ObservableObject {
     func connectSignaling(urlString: String, room: String) {
         signalingUrl = urlString
         signalingRoom = room
+        isStopping = false
+        reconnectAttempts = 0
+        cancelReconnect()
 
         if peerConnection == nil {
             startPeer()
@@ -77,6 +83,8 @@ final class WebRTCClient: NSObject, ObservableObject {
     }
 
     func disconnectSignaling() {
+        isStopping = true
+        cancelReconnect()
         wsTask?.cancel(with: .goingAway, reason: nil)
         wsTask = nil
         wsSession?.invalidateAndCancel()
@@ -92,6 +100,7 @@ final class WebRTCClient: NSObject, ObservableObject {
                 DispatchQueue.main.async {
                     self.status = "signaling recv error: \(error.localizedDescription)"
                 }
+                self.scheduleReconnect(reason: "recv error")
             case .success(let message):
                 switch message {
                 case .string(let text):
@@ -143,6 +152,38 @@ final class WebRTCClient: NSObject, ObservableObject {
         if let text = String(data: data, encoding: .utf8) {
             wsTask.send(.string(text)) { _ in }
         }
+    }
+
+    private func resetPeer() {
+        dataChannel?.close()
+        dataChannel = nil
+        peerConnection?.close()
+        peerConnection = nil
+        dcState = "closed"
+    }
+
+    private func cancelReconnect() {
+        reconnectTimer?.cancel()
+        reconnectTimer = nil
+    }
+
+    private func scheduleReconnect(reason: String) {
+        if isStopping { return }
+        if reconnectTimer != nil { return }
+        reconnectAttempts = min(reconnectAttempts + 1, 6)
+        let delay = Double(min(2 * reconnectAttempts, 10))
+        DispatchQueue.main.async {
+            self.status = "reconnecting in \(Int(delay))s (\(reason))"
+        }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.reconnectTimer = nil
+            self.resetPeer()
+            self.startPeer()
+            self.connectSignaling(urlString: self.signalingUrl, room: self.signalingRoom)
+        }
+        reconnectTimer = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     // ✅ Chrome에서 만든 Offer를 iPhone에 적용
