@@ -13,6 +13,6 @@ VR --(WebRTC)-- PC --(WebRTC)-- iPhone
    3. IMUSender에서 DataChannel state: open이 되면 Start AR눌러서 실행
 3. VR-PC 연결
    1. PC쪽에서 Start Broadcast
-   2. VR용 폰에서 receiver_sensor.html 접속 후 방 이름 맞추고 Join Broadcast
+   2. VR용 폰에서 viewer_video_sensor2.html 접속 후 방 이름 맞추고 Join Broadcast
    3. Enable Sensors
    4. Fullscreen버튼 눌러서 전체화면 전환 후 VR 장착
