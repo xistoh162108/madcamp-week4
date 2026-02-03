@@ -7,7 +7,7 @@ struct ContentView: View {
     @StateObject private var motion: ARPoseStreamer
 
     @State private var hzText: String = "100"
-    @State private var signalingUrl: String = "ws://3.37.140.87:8080"
+    @State private var signalingUrl: String = "wss://eokbba.shop"
     @State private var signalingRoom: String = "imu"
 
     init() {
@@ -31,7 +31,7 @@ struct ContentView: View {
                 Text("Signaling Server")
                     .font(.headline)
 
-                TextField("ws://EC2_PUBLIC_IP:8080", text: $signalingUrl)
+                TextField("wss://your-domain", text: $signalingUrl)
                     .textFieldStyle(.roundedBorder)
 
                 TextField("room id", text: $signalingRoom)

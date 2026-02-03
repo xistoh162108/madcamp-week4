@@ -16,7 +16,7 @@ final class WebRTCClient: NSObject, ObservableObject {
     private var wsTask: URLSessionWebSocketTask?
     private var wsSession: URLSession?
     private var signalingRoom: String = "imu"
-    private var signalingUrl: String = "ws://3.37.140.87:8080"
+    private var signalingUrl: String = "wss://eokbba.shop"
 
     override init() {
         RTCInitializeSSL()
