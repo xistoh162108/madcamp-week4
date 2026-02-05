@@ -23,6 +23,11 @@ Visualizer/.env
 /[Uu]ser[Ss]ettings/
 
 *.pem
+*.glb
+
+*/*.glb
+webRTCdemo/donggenWithLigging1.glb
+webRTCdemo/donggenWithLigging2.glb
 
 # Large Assets
 donggenWithLigging2.usdz

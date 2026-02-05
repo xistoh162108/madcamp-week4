@@ -38,6 +38,13 @@ function ensureRoom(room) {
   return rooms.get(room);
 }
 
+function roomHasOfferer(set) {
+  for (const peer of set) {
+    if (peer.role === "offerer") return true;
+  }
+  return false;
+}
+
 wss.on("connection", (ws) => {
   ws.on("message", (msg) => {
     const m = safeJsonParse(msg);
@@ -52,7 +59,13 @@ wss.on("connection", (ws) => {
         }
       : null;
     if (m.type && m.type !== "ice") {
-      console.log("[in]", m.type, m.room, m.sender || ws.sender || "", sdpInfo || "");
+      console.log(
+        "[in]",
+        m.type,
+        m.room,
+        m.sender || ws.sender || "",
+        sdpInfo || "",
+      );
     }
 
     // join room
@@ -64,8 +77,19 @@ wss.on("connection", (ws) => {
       if (m.viewerId) ws.viewerId = m.viewerId;
 
       const set = ensureRoom(room);
+      const joinIndex = set.size + 1;
+      const hasOfferer = roomHasOfferer(set);
+      ws.role = hasOfferer ? "answerer" : "offerer";
       set.add(ws);
-      ws.send(JSON.stringify({ type: "joined", sender: ws.sender, room }));
+      ws.send(
+        JSON.stringify({
+          type: "joined",
+          sender: ws.sender,
+          room,
+          index: joinIndex,
+          role: ws.role,
+        }),
+      );
       return;
     }
 
@@ -82,7 +106,13 @@ wss.on("connection", (ws) => {
     peers.forEach((p) => {
       if (p !== ws && p.readyState === WebSocket.OPEN) {
         if (m.type && m.type !== "ice") {
-          console.log("[out]", m.type, ws.room, payload.sender || "", sdpInfo || "");
+          console.log(
+            "[out]",
+            m.type,
+            ws.room,
+            payload.sender || "",
+            sdpInfo || "",
+          );
         }
         p.send(JSON.stringify(payload));
       }

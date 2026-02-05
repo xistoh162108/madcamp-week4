@@ -20,6 +20,9 @@ final class WebRTCClient: NSObject, ObservableObject {
     private var reconnectTimer: DispatchWorkItem?
     private var reconnectAttempts: Int = 0
     private var isStopping: Bool = false
+    private var joinRole: String?
+    private var shouldOffer: Bool = false
+    private var offerSent: Bool = false
 
     override init() {
         RTCInitializeSSL()
@@ -58,7 +61,11 @@ final class WebRTCClient: NSObject, ObservableObject {
         signalingRoom = room
         isStopping = false
         reconnectAttempts = 0
+        joinRole = nil
+        shouldOffer = false
+        offerSent = false
         cancelReconnect()
+        print("[signal] connect url=\(urlString) room=\(room)")
 
         if peerConnection == nil {
             startPeer()
@@ -85,6 +92,8 @@ final class WebRTCClient: NSObject, ObservableObject {
     func disconnectSignaling() {
         isStopping = true
         cancelReconnect()
+        joinRole = nil
+        shouldOffer = false
         wsTask?.cancel(with: .goingAway, reason: nil)
         wsTask = nil
         wsSession?.invalidateAndCancel()
@@ -122,6 +131,7 @@ final class WebRTCClient: NSObject, ObservableObject {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         guard let type = obj["type"] as? String else { return }
 
+        print("[signal] recv type=\(type) room=\(obj["room"] ?? "")")
         if type == "offer", let sdp = obj["sdp"] as? String {
             DispatchQueue.main.async { self.status = "offer received" }
             setRemoteOfferSdp(sdp)
@@ -130,8 +140,19 @@ final class WebRTCClient: NSObject, ObservableObject {
         }
 
         if type == "joined" {
-            DispatchQueue.main.async { self.status = "signaling joined (\(self.signalingRoom))" }
-            sendSignal(["type": "ready"])
+            joinRole = obj["role"] as? String
+            shouldOffer = joinRole == "offerer"
+            DispatchQueue.main.async {
+                self.status = "signaling joined (\(self.signalingRoom)) role=\(self.joinRole ?? "?")"
+            }
+            if shouldOffer {
+                if !offerSent {
+                    createDataChannelIfNeeded()
+                    createOfferAndSend()
+                }
+            } else {
+                sendSignal(["type": "ready"])
+            }
             return
         }
 
@@ -144,12 +165,21 @@ final class WebRTCClient: NSObject, ObservableObject {
             addRemoteIceCandidate(cand)
             return
         }
+
+        if type == "answer", let sdp = obj["sdp"] as? String {
+            DispatchQueue.main.async { self.status = "answer received" }
+            setRemoteAnswerSdp(sdp)
+            return
+        }
     }
 
     private func sendSignal(_ payload: [String: Any]) {
         guard let wsTask = wsTask else { return }
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else { return }
         if let text = String(data: data, encoding: .utf8) {
+            if let type = payload["type"] as? String {
+                print("[signal] send type=\(type) room=\(payload["room"] ?? "")")
+            }
             wsTask.send(.string(text)) { _ in }
         }
     }
@@ -160,6 +190,9 @@ final class WebRTCClient: NSObject, ObservableObject {
         peerConnection?.close()
         peerConnection = nil
         dcState = "closed"
+        joinRole = nil
+        shouldOffer = false
+        offerSent = false
     }
 
     private func cancelReconnect() {
@@ -234,6 +267,90 @@ final class WebRTCClient: NSObject, ObservableObject {
         }
     }
 
+    func setRemoteAnswerSdp(_ sdpString: String) {
+        guard let pc = peerConnection else {
+            status = "peerConnection nil (Start Peer 먼저)"
+            return
+        }
+
+        var sdp = sdpString
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\n", with: "\r\n")
+        if !sdp.hasSuffix("\r\n") {
+            sdp.append("\r\n")
+        }
+        if sdp.isEmpty || !sdp.contains("v=0") {
+            status = "answer SDP invalid"
+            return
+        }
+
+        status = "setting remote answer..."
+        let desc = RTCSessionDescription(type: .answer, sdp: sdp)
+
+        pc.setRemoteDescription(desc) { [weak self] err in
+            DispatchQueue.main.async {
+                if let err = err {
+                    self?.status = "setRemote answer err: \(err.localizedDescription)"
+                } else {
+                    self?.status = "remote answer set"
+                }
+            }
+        }
+    }
+
+    func createOfferAndSend() {
+        guard let pc = peerConnection else { return }
+        status = "creating offer..."
+        print("[signal] createOffer")
+
+        let constraints = RTCMediaConstraints(
+            mandatoryConstraints: [
+                "OfferToReceiveAudio": "false",
+                "OfferToReceiveVideo": "false"
+            ],
+            optionalConstraints: nil
+        )
+
+        pc.offer(for: constraints) { [weak self] (sdp: RTCSessionDescription?, error: Error?) in
+            guard let self = self else { return }
+
+            if let error = error {
+                DispatchQueue.main.async { self.status = "offer error: \(error.localizedDescription)" }
+                return
+            }
+            guard let sdp = sdp else {
+                DispatchQueue.main.async { self.status = "offer error: nil sdp" }
+                return
+            }
+
+            pc.setLocalDescription(sdp) { err in
+                DispatchQueue.main.async {
+                    if let err = err {
+                        self.status = "setLocal offer err: \(err.localizedDescription)"
+                    } else {
+                        self.status = "offer sent"
+                        self.offerSent = true
+                        print("[signal] offer sent")
+                        self.sendSignal(["type": "offer", "sdp": sdp.sdp])
+                    }
+                }
+            }
+        }
+    }
+
+    private func createDataChannelIfNeeded() {
+        guard dataChannel == nil, let pc = peerConnection else { return }
+        let config = RTCDataChannelConfiguration()
+        config.isOrdered = true
+        let ch = pc.dataChannel(forLabel: "imu", configuration: config)
+        if let ch = ch {
+            dataChannel = ch
+            ch.delegate = self
+            DispatchQueue.main.async { self.status = "datachannel created: \(ch.label)" }
+        }
+    }
+
     // ✅ iPhone이 Answer 생성해서 Chrome에 전달
     func createAnswer() {
         guard let pc = peerConnection else {
@@ -278,6 +395,7 @@ final class WebRTCClient: NSObject, ObservableObject {
     func createAnswerAndSend() {
         guard let pc = peerConnection else { return }
         status = "creating answer..."
+        print("[signal] createAnswer")
 
         let constraints = RTCMediaConstraints(
             mandatoryConstraints: [
@@ -306,6 +424,7 @@ final class WebRTCClient: NSObject, ObservableObject {
                     } else {
                         self.localAnswerSdp = sdp.sdp
                         self.status = "answer sent"
+                        print("[signal] answer sent")
                         self.sendSignal(["type": "answer", "sdp": sdp.sdp])
                     }
                 }
