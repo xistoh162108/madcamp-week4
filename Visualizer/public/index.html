@@ -5,9 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Madcamp Visualizer</title>
     <script src="/socket.io/socket.io.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-    <!-- Add OrbitControls -->
-    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
     <style>
         body { margin: 0; overflow: hidden; background: #000; font-family: monospace; }
         
@@ -193,7 +198,9 @@
         <div id="raw-json" class="json-block">Waiting...</div>
         <h3>ML Inference Result</h3>
         <div id="ml-json" class="json-block">Waiting...</div>
-        <h3>WebRTC Remote Data</h3>
+        <h3>WebRTC Outgoing (72B Skeleton)</h3>
+        <div id="webrtc-out-json" class="json-block">No data yet.</div>
+        <h3>WebRTC Remote (Incoming) Data</h3>
         <div id="webrtc-json" class="json-block">No data yet.</div>
     </div>
 
@@ -225,8 +232,13 @@
         <!-- Logs go here -->
     </div>
 
-    <script>
-        // Setup Three.js
+    <script type="module">
+        // Setup
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { USDZLoader } from 'three/addons/loaders/USDZLoader.js';
+
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(0x111111);
         
@@ -239,7 +251,7 @@
         document.body.appendChild(renderer.domElement);
 
         // --- Camera Controls ---
-        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        const controls = new OrbitControls(camera, renderer.domElement);
         controls.enableDamping = true;
         controls.dampingFactor = 0.05;
         controls.screenSpacePanning = true;
@@ -332,6 +344,18 @@
         // Simple colorful axis base at origin
         scene.add(new THREE.AxesHelper(0.2));
 
+        // --- Avatar Loader (donggen) ---
+        const usdzLoader = new USDZLoader();
+        usdzLoader.load('donggenWithLigging2.usdz', (usdz) => {
+            console.log("Avatar 'donggen' loaded successfully");
+            const avatar = usdz;
+            // Position at -2m on the X-axis (Red axis), lifted by 0.95m
+            avatar.position.set(-2, 0.95, 0);
+            scene.add(avatar);
+        }, undefined, (error) => {
+            console.error("Error loading USDZ avatar:", error);
+        });
+
         // --- Objects ---
         
         // Head (Cube)
@@ -368,6 +392,36 @@
         phoneMesh.add(new THREE.AxesHelper(0.1));
         phoneMesh.visible = false;
         scene.add(phoneMesh);
+
+        // --- Lightsaber Loader ---
+        const loader = new GLTFLoader();
+        let lightsaberModel = null;
+        let activeSabers = [];
+
+        loader.load('lightsaber2.glb', (gltf) => {
+            console.log("Lightsaber loaded successfully");
+            lightsaberModel = gltf.scene;
+            
+            // Adjust scale if needed (Standard GLBs might be large or small)
+            // lightsaberModel.scale.set(1.0, 1.0, 1.0); 
+            
+            // Clone for both meshes
+            const saber1 = lightsaberModel.clone();
+            const saber2 = lightsaberModel.clone();
+            activeSabers = [saber1, saber2];
+            
+            // Orientation: Handle at origin, Blade along -X
+            saber1.rotation.y = -Math.PI / 2;
+            saber2.rotation.y = -Math.PI / 2;
+            
+            // If the model is Y-up, we might need to combine rotations. 
+            // Setting a baseline for Y-axis rotation as requested:
+            
+            phoneMesh.add(saber1);
+            ctrlMesh.add(saber2);
+        }, undefined, (error) => {
+            console.error("Error loading lightsaber:", error);
+        });
         
         // Pivot/Offset for phone preview (e.g. 30cm to the right of head)
         const phonePreviewOffset = new THREE.Vector3(0.3, -0.2, -0.5);
@@ -705,19 +759,37 @@
             }
         });
 
+        socket.on('webrtc_out', (data) => {
+            const el = document.getElementById('webrtc-out-json');
+            const isStale = data.stale;
+            
+            let text = `[${new Date(data.timestamp).toLocaleTimeString()}] ${data.length} bytes\n`;
+            text += `<b>Status: ${isStale ? '<span style="color:#ff6600">SAFE POSE (Heartbeat)</span>' : '<span style="color:#00ff00">LIVE (124B Sword+Skel)</span>'}</b>\n`;
+            
+            if (data.vectors) {
+                const hP = data.vectors.headPos;
+                const sP = data.vectors.swordPos;
+                const sF = data.vectors.swordFwd;
+                text += `Head Pos: ${hP[0].toFixed(2)}, ${hP[1].toFixed(2)}, ${hP[2].toFixed(2)}\n`;
+                text += `Sword Pos: ${sP[0].toFixed(2)}, ${sP[1].toFixed(2)}, ${sP[2].toFixed(2)}\n`;
+                text += `Sword Fwd: ${sF[0].toFixed(2)}, ${sF[1].toFixed(2)}, ${sF[2].toFixed(2)}\n`;
+                text += `(Full Body & Elbows active in stream)\n`;
+            }
+            
+            text += `HEX: <span style="font-size:10px; color:#888;">${data.hex.substring(0, 48)}...</span>`;
+            el.innerHTML = text.replace(/\n/g, '<br>');
+        });
+
         socket.on('webrtc_data', (data) => {
             const el = document.getElementById('webrtc-json');
             let text = `[${new Date(data.timestamp).toLocaleTimeString()}] ${data.length} bytes\n`;
             
             if (data.length === 72) {
-                // SPECIAL: 72-Byte Joint + Root Pose Protocol
                 text += `<b>[72B Skeleton Packet]</b>\n`;
-                
-                // Detection for Stale/Safe Pose Flag (Bit 31 of first 4 bytes)
-                // Since data.hex is available, we can peek at the first byte (LE so it's the 4th hex pair)
-                // Or just use the 'raw' string if it was parsed.
-                // For now, let's assume the server might send a flag.
                 text += `(Real-time Skeleton Stream)\n`;
+                if (data.hex) {
+                    text += `HEX: <span style="font-size:10px; color:#888;">${data.hex.substring(0, 40)}...</span>`;
+                }
             } else if (data.parsed) {
                 text += `Seq: ${data.parsed.seq}\n`;
                 text += `Pos: ${data.parsed.pos.map(v => v.toFixed(3)).join(', ')}\n`;
@@ -823,6 +895,26 @@
             } else {
                 iphoneAxes.visible = false;
             }
+
+            // 6. Update Collision Visuals
+            const isColliding = data.connection ? data.connection.isColliding : false;
+            activeSabers.forEach(saber => {
+                saber.traverse(child => {
+                    if (child.isMesh) {
+                        // Tint emissive or base color red
+                        if (isColliding) {
+                            if (!child.userData.origColor) child.userData.origColor = child.material.color.getHex();
+                            child.material.color.setHex(0xff0000);
+                            if (child.material.emissive) child.material.emissive.setHex(0x660000);
+                        } else {
+                            if (child.userData.origColor !== undefined) {
+                                child.material.color.setHex(child.userData.origColor);
+                                if (child.material.emissive) child.material.emissive.setHex(0x000000);
+                            }
+                        }
+                    }
+                });
+            });
         });
         
         // --- ML Skeleton Visualization ---

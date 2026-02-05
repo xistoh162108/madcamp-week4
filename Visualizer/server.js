@@ -164,112 +164,83 @@ function serializeVPData(data) {
   return buf;
 }
 
-let seq72 = 0;
+let seq100 = 0;
 let lastVpData = null;
 let lastVpTimestamp = 0;
 
 /**
- * Calculates joint angles (Skeleton) from raw VP tracking data.
- * Derives body yaw, head pitch, and arm angles using geometric IK.
+ * Quaternion rotation helper
  */
-function calculateJointAngles(data) {
-  const angles = {
-    bodyYaw: 0,
-    headPitch: 0,
-    left: { armPitch: 0, armYaw: 0, armAbd: 0, elbowPitch: 0 },
-    right: { armPitch: 0, armYaw: 0, armAbd: 0, elbowPitch: 0 }
-  };
-
-  if (!data || !data.head) return angles;
-
-  // 1. Head angles (Derived from Quat)
-  const [qx, qy, qz, qw] = data.head.rot;
-  angles.bodyYaw = Math.atan2(2 * (qw * qy + qx * qz), 1 - 2 * (qy * qy + qz * qz));
-  angles.headPitch = Math.asin(Math.max(-1, Math.min(1, 2 * (qw * qx - qy * qz))));
-
-  const headPos = data.head.pos;
-
-  const processArm = (hand, side) => {
-    // ARKit standard hand joints: Index 0=Wrist, Index 26=Forearm/Elbow region
-    if (!hand || !hand.joints || hand.joints.length < 27) return;
-
-    // Estimate Shoulder position relative to head
-    const sideSign = side === 'left' ? -1 : 1;
-    const shoulderPos = [
-      headPos[0] + (sideSign * 0.15),
-      headPos[1] - 0.25,
-      headPos[2] - 0.05
-    ];
-
-    const elbowPos = hand.joints[26];
-    const wristPos = hand.joints[0];
-
-    // Upper Arm Vector (Shoulder -> Elbow)
-    const vU = [elbowPos[0] - shoulderPos[0], elbowPos[1] - shoulderPos[1], elbowPos[2] - shoulderPos[2]];
-    const lenU = Math.sqrt(vU[0] ** 2 + vU[1] ** 2 + vU[2] ** 2);
-
-    // Lower Arm Vector (Elbow -> Wrist)
-    const vL = [wristPos[0] - elbowPos[0], wristPos[1] - elbowPos[1], wristPos[2] - elbowPos[2]];
-    const lenL = Math.sqrt(vL[0] ** 2 + vL[1] ** 2 + vL[2] ** 2);
-
-    if (lenU > 0.01 && lenL > 0.01) {
-      // 1. Elbow Pitch
-      const dot = (vU[0] * vL[0] + vU[1] * vL[1] + vU[2] * vL[2]) / (lenU * lenL);
-      angles[side].elbowPitch = Math.acos(Math.max(-1, Math.min(1, dot)));
-
-      // 2. Arm Pitch/Yaw
-      angles[side].armPitch = Math.asin(-vU[1] / lenU);
-      angles[side].armYaw = Math.atan2(vU[0], -vU[2]);
-    }
-  };
-
-  processArm(data.leftHand, 'left');
-  processArm(data.rightHand, 'right');
-
-  return angles;
+function rotateVector(q, v) {
+  const [qx, qy, qz, qw] = q;
+  const [vx, vy, vz] = v;
+  const ix = qw * vx + qy * vz - qz * vy;
+  const iy = qw * vy + qz * vx - qx * vz;
+  const iz = qw * vz + qx * vy - qy * vx;
+  const iw = -qx * vx - qy * vy - qz * vz;
+  return [
+    ix * qw + iw * -qx + iy * -qz - iz * -qy,
+    iy * qw + iw * -qy + iz * -qx - ix * -qz,
+    iz * qw + iw * -qz + ix * -qy - iy * -qx
+  ];
 }
 
 /**
- * Packs tracking data into a fixed 72-byte binary format.
- * If data is null, generates a "Base Pose" (Neutral).
+ * Packs tracking data into a fixed 124-byte binary format.
+ * Format: Header(4B) + Head(24B) + LeftArm(36B) + RightArm(36B) + Sword(24B)
  */
-function serialize72BytePacket(data) {
+function serialize124BytePacket(data) {
   const isStale = !data || (Date.now() - lastVpTimestamp > 1000);
-  const angles = isStale ? {
-    bodyYaw: 0, headPitch: 0,
-    left: { armPitch: -0.2, armYaw: -0.5, armAbd: 0, elbowPitch: 0.1 },
-    right: { armPitch: -0.2, armYaw: 0.5, armAbd: 0, elbowPitch: 0.1 }
-  } : calculateJointAngles(data);
-
-  const buf = Buffer.alloc(72);
+  const buf = Buffer.alloc(124);
   let off = 0;
 
-  // 1. Header (4B) - Use 31st bit of seq as "Stale" flag
-  let finalSeq = seq72++;
+  // 1. Header (4B) - Bit 31 is Stale flag
+  let finalSeq = seq100++;
   if (isStale) finalSeq |= 0x80000000;
   buf.writeUInt32LE(finalSeq >>> 0, off); off += 4;
 
-  // 2. Root Pose (px, py, pz, qx, qy, qz, qw)
-  const headPos = (!isStale && data.head) ? data.head.pos : [0, 1.6, 0]; // 1.6m is avg eye height
-  const headRot = (!isStale && data.head) ? data.head.rot : [0, 0, 0, 1];
-  headPos.forEach(v => { buf.writeFloatLE(v, off); off += 4; });
-  headRot.forEach(v => { buf.writeFloatLE(v, off); off += 4; });
+  // 2. Head Data (24B)
+  const hPos = (!isStale && data.head) ? data.head.pos : [0, 1.6, 0];
+  const hRot = (!isStale && data.head) ? data.head.rot : [0, 0, 0, 1];
+  const hFwd = rotateVector(hRot, [0, 0, -1]); // ARKit forward is -Z
+  hPos.forEach(v => { buf.writeFloatLE(v, off); off += 4; });
+  hFwd.forEach(v => { buf.writeFloatLE(v, off); off += 4; });
 
-  // 3. Body/Head Angles (8B)
-  buf.writeFloatLE(angles.bodyYaw, off); off += 4;
-  buf.writeFloatLE(angles.headPitch, off); off += 4;
+  const packArm = (hand) => {
+    const pos = (!isStale && hand && hand.palmPose) ? hand.palmPose.pos : [0, 0, 0];
+    const rot = (!isStale && hand && hand.palmPose) ? hand.palmPose.rot : [0, 0, 0, 1];
+    const elbow = (!isStale && hand && hand.joints && hand.joints[26]) ? hand.joints[26] : [0, 0, 0];
+    const fwd = rotateVector(rot, [0, 0, 1]); // Hand forward / pointing direction
 
-  // 4. Left Arm (16B)
-  buf.writeFloatLE(angles.left.armPitch, off); off += 4;
-  buf.writeFloatLE(angles.left.armYaw, off); off += 4;
-  buf.writeFloatLE(angles.left.armAbd, off); off += 4;
-  buf.writeFloatLE(angles.left.elbowPitch, off); off += 4;
+    pos.forEach(v => { buf.writeFloatLE(v, off); off += 4; });
+    fwd.forEach(v => { buf.writeFloatLE(v, off); off += 4; });
+    elbow.forEach(v => { buf.writeFloatLE(v, off); off += 4; });
+  };
 
-  // 5. Right Arm (16B)
-  buf.writeFloatLE(angles.right.armPitch, off); off += 4;
-  buf.writeFloatLE(angles.right.armYaw, off); off += 4;
-  buf.writeFloatLE(angles.right.armAbd, off); off += 4;
-  buf.writeFloatLE(angles.right.elbowPitch, off); off += 4;
+  // 3. Left Arm (36B)
+  packArm(data ? data.leftHand : null);
+
+  // 4. Right Arm (36B)
+  packArm(data ? data.rightHand : null);
+
+  // 5. Sword Data (24B)
+  const sPos = (!isStale && data.controller) ? data.controller.pos : [0, 0, 0];
+  const sRot = (!isStale && data.controller) ? data.controller.rot : [0, 0, 0, 1];
+  const sFwd = rotateVector(sRot, [0, 0, 1]); // Hilt to Tip direction
+  sPos.forEach(v => { buf.writeFloatLE(v, off); off += 4; });
+  sFwd.forEach(v => { buf.writeFloatLE(v, off); off += 4; });
+
+  // Monitoring Emission for Dashboard
+  io.emit('webrtc_out', {
+    timestamp: Date.now(),
+    length: buf.length,
+    hex: buf.toString('hex'),
+    stale: isStale,
+    vectors: {
+      headPos: hPos, headFwd: hFwd,
+      swordPos: sPos, swordFwd: sFwd
+    }
+  });
 
   return buf;
 }
@@ -440,7 +411,7 @@ setInterval(() => {
     const isStale = (Date.now() - lastVpTimestamp > 1000);
     if (isStale) {
       // Send Base Pose if VP data is missing
-      const poseBuf = serialize72BytePacket(null);
+      const poseBuf = serialize124BytePacket(null);
       webrtc.send(poseBuf);
     }
   }
@@ -526,6 +497,7 @@ udpServer.on('message', (msg, rinfo) => {
     const isControllerConnected = (flags & (1 << 4)) !== 0;
     const isCalibrating = (flags & (1 << 5)) !== 0; // Bit 5
     const isCalibrated = (flags & (1 << 6)) !== 0; // Bit 6
+    const isColliding = (flags & (1 << 7)) !== 0;  // Bit 7
 
     // 🔹 Added state transition logging
     if (lastVpData) {
@@ -559,7 +531,8 @@ udpServer.on('message', (msg, rinfo) => {
         controller: isControllerConnected,
         calibrating: isCalibrating,
         progress: calibProgress,
-        calibrated: isCalibrated
+        calibrated: isCalibrated,
+        isColliding: isColliding
       },
       head: null,
       leftHand: null,
@@ -631,8 +604,8 @@ udpServer.on('message', (msg, rinfo) => {
 
     // 5. Broadcast via WebRTC
     if (isWebRTCStreaming && webrtc.isConnected() && webrtc.isDataChannelOpen()) {
-      // Send 72-byte Skeleton Pose (Optimized for avatar control)
-      const poseBuf = serialize72BytePacket(data);
+      // Send 124-byte Skeleton Pose (Optimized for avatar control)
+      const poseBuf = serialize124BytePacket(data);
       webrtc.send(poseBuf);
     }
 

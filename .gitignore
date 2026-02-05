@@ -23,3 +23,7 @@ Visualizer/.env
 /[Uu]ser[Ss]ettings/
 
 *.pem
+
+# Large Assets
+donggenWithLigging2.usdz
+**/donggenWithLigging2.usdz
