@@ -1,0 +1,494 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <title>WebRTC Viewer + Sensor (Canvas Broadcast)</title>
+    <style>
+      body {
+        margin: 0;
+        font-family:
+          system-ui,
+          -apple-system,
+          sans-serif;
+        background: #000;
+        color: #fff;
+      }
+      #ui {
+        position: fixed;
+        left: 12px;
+        top: 12px;
+        z-index: 10;
+        background: rgba(0, 0, 0, 0.65);
+        padding: 10px;
+        border-radius: 10px;
+        width: 260px;
+      }
+      #ui input {
+        width: 100%;
+        padding: 6px 8px;
+        box-sizing: border-box;
+      }
+      button {
+        padding: 6px 10px;
+        margin-top: 8px;
+        width: 100%;
+      }
+      #status {
+        font-size: 12px;
+        white-space: pre;
+        margin-top: 8px;
+      }
+      video {
+        position: fixed;
+        inset: 0;
+        width: 100vw;
+        height: 100vh;
+        object-fit: contain;
+        background: #000;
+        z-index: 0;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="ui">
+      <input id="roomId" value="imu-view" />
+      <button id="btnJoin">Join Broadcast</button>
+      <button id="btnSensor">Enable Sensors</button>
+      <div id="status">idle</div>
+    </div>
+
+    <video id="video" autoplay playsinline muted></video>
+
+    <script>
+      var roomInput = document.getElementById("roomId");
+      var btnJoin = document.getElementById("btnJoin");
+      var btnSensor = document.getElementById("btnSensor");
+      var statusEl = document.getElementById("status");
+      var videoEl = document.getElementById("video");
+      statusEl.textContent = "js loaded";
+
+      var signalingUrl = "wss://eokbba.shop";
+      var clientId =
+        (window.crypto && window.crypto.randomUUID && window.crypto.randomUUID()) ||
+        Math.random().toString(36).slice(2);
+
+      var ws = null;
+      var wsState = "disconnected";
+      var pc = null;
+      var dc = null;
+      var roomId = "imu";
+      var broadcasterId = null;
+      var hasOffer = false;
+      var localOffered = false;
+      var readyTimer = null;
+      var msgCount = 0;
+      var lastMsg = "";
+
+      var sensorEnabled = false;
+      var sensorSeq = 0;
+      var lastSendTs = 0;
+      var sendIntervalMs = 33; // ~30Hz
+      var ori = { alpha: 0, beta: 0, gamma: 0 };
+      var acc = { x: 0, y: 0, z: 0 };
+
+      function updateStatus(extra) {
+        var pcState = "none";
+        var iceState = "none";
+        var dcState = dc ? dc.readyState : "none";
+        if (pc) {
+          pcState = pc.connectionState || pc.iceConnectionState || "unknown";
+          iceState = pc.iceConnectionState || "unknown";
+        }
+        statusEl.textContent =
+          "ws: " + wsState +
+          "\npc: " + pcState +
+          "\nice: " + iceState +
+          "\ndc: " + dcState +
+          "\nmsg: " + msgCount +
+          (lastMsg ? "\nlast: " + lastMsg : "") +
+          "\nsensor: " + (sensorEnabled ? "on" : "off");
+        if (extra) {
+          statusEl.textContent += "\n" + extra;
+        }
+      }
+
+      function sendSignal(payload) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        ws.send(
+          JSON.stringify({
+            sender: clientId,
+            room: roomId + "-view",
+            type: payload.type,
+            sdp: payload.sdp,
+            candidate: payload.candidate,
+            to: payload.to,
+          }),
+        );
+      }
+
+      function connectSignaling() {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+          updateStatus("ws already connecting/open");
+          if (ws.readyState === WebSocket.OPEN) {
+            sendSignal({ type: "join" });
+            sendSignal({ type: "ready" });
+            if (broadcasterId && !localOffered) {
+              createLocalOffer();
+            }
+          }
+          return;
+        }
+        ws = new WebSocket(signalingUrl);
+        wsState = "connecting";
+        updateStatus();
+        var connectTimer = setTimeout(function () {
+          if (ws && ws.readyState === WebSocket.CONNECTING) {
+            updateStatus("ws timeout");
+            try {
+              ws.close();
+            } catch (e) {}
+          }
+        }, 5000);
+
+        ws.onopen = function () {
+          wsState = "open";
+          clearTimeout(connectTimer);
+          updateStatus();
+          sendSignal({ type: "join" });
+          sendSignal({ type: "ready" });
+          if (broadcasterId && !localOffered) {
+            createLocalOffer();
+          }
+          if (readyTimer) {
+            clearInterval(readyTimer);
+          }
+          readyTimer = setInterval(function () {
+            if (!hasOffer && ws && ws.readyState === WebSocket.OPEN) {
+              sendSignal({ type: "ready" });
+              updateStatus("ready retry");
+              if (broadcasterId && !localOffered) {
+                createLocalOffer();
+              }
+            }
+          }, 2000);
+        };
+
+        ws.onclose = function () {
+          wsState = "closed";
+          clearTimeout(connectTimer);
+          if (readyTimer) {
+            clearInterval(readyTimer);
+            readyTimer = null;
+          }
+          updateStatus();
+        };
+
+        ws.onerror = function () {
+          wsState = "error";
+          clearTimeout(connectTimer);
+          if (readyTimer) {
+            clearInterval(readyTimer);
+            readyTimer = null;
+          }
+          updateStatus("ws error");
+        };
+
+        ws.onmessage = function (evt) {
+          var msg = null;
+          try {
+            msg = JSON.parse(evt.data);
+          } catch (e) {
+            return;
+          }
+          msgCount += 1;
+          lastMsg = (msg && msg.type ? msg.type : "unknown") + " from " + (msg && msg.sender ? msg.sender : "?");
+          updateStatus();
+          if (!msg || msg.sender === clientId) return;
+          if (msg.room && msg.room !== roomId + "-view") return;
+
+          if (msg.type === "hello") {
+            broadcasterId = msg.sender;
+            updateStatus("hello recv");
+            if (!localOffered) {
+              createLocalOffer();
+            }
+            return;
+          }
+          if (msg.type === "offer" && msg.sdp && (!msg.to || msg.to === clientId)) {
+            if (localOffered) {
+              updateStatus("offer ignored");
+              return;
+            }
+            broadcasterId = msg.sender;
+            hasOffer = true;
+            updateStatus("offer recv");
+            ensurePeer();
+            pc
+              .setRemoteDescription({ type: "offer", sdp: msg.sdp })
+              .then(function () {
+                var legacyConstraints = { mandatory: { OfferToReceiveVideo: true } };
+                try {
+                  return pc.createAnswer(legacyConstraints);
+                } catch (e) {
+                  return pc.createAnswer();
+                }
+              })
+              .then(function (answer) {
+                return pc.setLocalDescription(answer);
+              })
+              .then(function () {
+                sendSignal({ type: "answer", sdp: pc.localDescription.sdp, to: broadcasterId });
+                updateStatus("answer sent");
+              })
+              .catch(function () {
+                updateStatus("offer err");
+              });
+            return;
+          }
+          if (msg.type === "answer" && msg.sdp && (!msg.to || msg.to === clientId)) {
+            if (!pc) return;
+            pc
+              .setRemoteDescription({ type: "answer", sdp: msg.sdp })
+              .then(function () {
+                updateStatus("answer recv");
+              })
+              .catch(function () {
+                updateStatus("answer err");
+              });
+            return;
+          }
+          if (msg.type === "ice" && msg.candidate && (!msg.to || msg.to === clientId)) {
+            if (!pc) return;
+            try {
+              pc.addIceCandidate(msg.candidate);
+            } catch (e) {}
+            updateStatus("ice recv");
+            if (!hasOffer && ws && ws.readyState === WebSocket.OPEN) {
+              sendSignal({ type: "ready" });
+              updateStatus("ready retry");
+            }
+            return;
+          }
+        };
+      }
+
+      function ensurePeer() {
+        if (pc) return pc;
+        pc = new RTCPeerConnection({
+          sdpSemantics: "plan-b",
+          iceServers: [
+            { urls: "stun:3.37.140.87:3478" },
+            {
+              urls: [
+                "turn:3.37.140.87:3478?transport=udp",
+                "turn:3.37.140.87:3478?transport=tcp",
+              ],
+              username: "imuuser",
+              credential: "imupass",
+            },
+          ],
+        });
+
+        dc = pc.createDataChannel("sensor", { ordered: false, maxRetransmits: 0 });
+        dc.onopen = function () {
+          updateStatus("dc open");
+        };
+        dc.onclose = function () {
+          updateStatus("dc closed");
+        };
+
+        pc.ondatachannel = function (e) {
+          dc = e.channel;
+          dc.onopen = function () {
+            updateStatus("dc open");
+          };
+          dc.onclose = function () {
+            updateStatus("dc closed");
+          };
+        };
+
+        pc.onicecandidate = function (e) {
+          if (!e.candidate || !broadcasterId) return;
+          var obj = {
+            candidate: e.candidate.candidate,
+            sdpMLineIndex: e.candidate.sdpMLineIndex,
+            sdpMid: e.candidate.sdpMid,
+          };
+          sendSignal({ type: "ice", candidate: obj, to: broadcasterId });
+          updateStatus("ice sent");
+        };
+
+        pc.ontrack = function (e) {
+          if (videoEl.srcObject !== e.streams[0]) {
+            videoEl.srcObject = e.streams[0];
+            try {
+              videoEl.play();
+            } catch (err) {}
+            updateStatus("track received");
+          }
+        };
+
+        pc.onaddstream = function (e) {
+          if (videoEl.srcObject !== e.stream) {
+            videoEl.srcObject = e.stream;
+            try {
+              videoEl.play();
+            } catch (err) {}
+            updateStatus("stream received");
+          }
+        };
+
+        pc.onconnectionstatechange = function () {
+          updateStatus();
+        };
+        pc.oniceconnectionstatechange = function () {
+          updateStatus();
+        };
+        updateStatus();
+        return pc;
+      }
+
+      function createLocalOffer() {
+        if (localOffered) return;
+        if (!broadcasterId) return;
+        ensurePeer();
+        localOffered = true;
+        updateStatus("offer send");
+        var legacyConstraints = { mandatory: { OfferToReceiveVideo: true } };
+        var offerPromise = null;
+        try {
+          offerPromise = pc.createOffer(legacyConstraints);
+        } catch (e) {
+          offerPromise = pc.createOffer();
+        }
+        offerPromise
+          .then(function (offer) {
+            return pc.setLocalDescription(offer);
+          })
+          .then(function () {
+            sendSignal({ type: "offer", sdp: pc.localDescription.sdp, to: broadcasterId });
+            updateStatus("offer sent");
+          })
+          .catch(function () {
+            localOffered = false;
+            updateStatus("offer err");
+          });
+      }
+
+      function joinBroadcast() {
+        roomId = (roomInput && roomInput.value.trim()) || "imu";
+        hasOffer = false;
+        localOffered = false;
+        msgCount = 0;
+        lastMsg = "";
+        updateStatus("joining...");
+        if (ws && ws.readyState === WebSocket.CLOSING) {
+          try {
+            ws.close();
+          } catch (e) {}
+          ws = null;
+        }
+        if (ws && ws.readyState === WebSocket.CLOSED) {
+          ws = null;
+        }
+        connectSignaling();
+      }
+
+      function packSensorPayload() {
+        var buf = new ArrayBuffer(28);
+        var dv = new DataView(buf);
+        dv.setUint32(0, sensorSeq, true);
+        dv.setFloat32(4, ori.alpha || 0, true);
+        dv.setFloat32(8, ori.beta || 0, true);
+        dv.setFloat32(12, ori.gamma || 0, true);
+        dv.setFloat32(16, acc.x || 0, true);
+        dv.setFloat32(20, acc.y || 0, true);
+        dv.setFloat32(24, acc.z || 0, true);
+        return buf;
+      }
+
+      function maybeSendSensor(now) {
+        if (!sensorEnabled) return;
+        if (!dc || dc.readyState !== "open") return;
+        if (now - lastSendTs < sendIntervalMs) return;
+        lastSendTs = now;
+        sensorSeq = (sensorSeq + 1) >>> 0;
+        try {
+          dc.send(packSensorPayload());
+        } catch (e) {}
+      }
+
+      function onOrientation(e) {
+        ori.alpha = e.alpha || 0;
+        ori.beta = e.beta || 0;
+        ori.gamma = e.gamma || 0;
+        maybeSendSensor(performance.now());
+      }
+
+      function onMotion(e) {
+        if (e.accelerationIncludingGravity) {
+          acc.x = e.accelerationIncludingGravity.x || 0;
+          acc.y = e.accelerationIncludingGravity.y || 0;
+          acc.z = e.accelerationIncludingGravity.z || 0;
+        } else if (e.acceleration) {
+          acc.x = e.acceleration.x || 0;
+          acc.y = e.acceleration.y || 0;
+          acc.z = e.acceleration.z || 0;
+        }
+        maybeSendSensor(performance.now());
+      }
+
+      function enableSensors() {
+        if (sensorEnabled) return;
+        sensorEnabled = true;
+        updateStatus("sensor enabled");
+        window.addEventListener("deviceorientation", onOrientation, true);
+        window.addEventListener("devicemotion", onMotion, true);
+      }
+
+      btnSensor.onclick = function () {
+        if (typeof DeviceMotionEvent !== "undefined" &&
+            typeof DeviceMotionEvent.requestPermission === "function") {
+          DeviceMotionEvent.requestPermission()
+            .then(function (state) {
+              if (state === "granted") {
+                enableSensors();
+              } else {
+                updateStatus("sensor denied");
+              }
+            })
+            .catch(function () {
+              updateStatus("sensor denied");
+            });
+        } else {
+          enableSensors();
+        }
+      };
+
+      btnJoin.onclick = joinBroadcast;
+      btnJoin.ontouchstart = function (e) {
+        e.preventDefault();
+        joinBroadcast();
+      };
+
+      window.addEventListener("beforeunload", function () {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.close(1000, "page unload");
+        }
+        if (pc) {
+          try {
+            pc.close();
+          } catch (e) {}
+        }
+        window.removeEventListener("deviceorientation", onOrientation, true);
+        window.removeEventListener("devicemotion", onMotion, true);
+      });
+
+      updateStatus();
+    </script>
+  </body>
+</html>

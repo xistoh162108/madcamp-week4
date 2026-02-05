@@ -7,8 +7,7 @@ struct ContentView: View {
     @StateObject private var motion: ARPoseStreamer
 
     @State private var hzText: String = "100"
-    @State private var signalingUrl: String = "ws://3.37.140.87:8080"
-    @State private var signalingRoom: String = "imu"
+    @State private var signalingRoom: String = "imu-data"
 
     init() {
         let webrtc = WebRTCClient()
@@ -28,19 +27,12 @@ struct ContentView: View {
 
                 Divider()
 
-                Text("Signaling Server")
-                    .font(.headline)
-
-                TextField("ws://EC2_PUBLIC_IP:8080", text: $signalingUrl)
-                    .textFieldStyle(.roundedBorder)
-
                 TextField("room id", text: $signalingRoom)
                     .textFieldStyle(.roundedBorder)
 
                 Button("Connect Signaling") {
-                    let url = signalingUrl.trimmingCharacters(in: .whitespacesAndNewlines)
                     let room = signalingRoom.trimmingCharacters(in: .whitespacesAndNewlines)
-                    webrtc.connectSignaling(urlString: url, room: room.isEmpty ? "imu" : room)
+                    webrtc.connectSignaling(urlString: "wss://eokbba.shop", room: room.isEmpty ? "imu" : room)
                 }
                 .buttonStyle(.borderedProminent)
 

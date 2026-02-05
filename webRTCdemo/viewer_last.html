@@ -1,0 +1,788 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Cache-Control"
+      content="no-store, no-cache, must-revalidate, max-age=0"
+    />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <title>WebRTC Viewer (Canvas Broadcast)</title>
+    <style>
+      body {
+        margin: 0;
+        font-family:
+          system-ui,
+          -apple-system,
+          sans-serif;
+        background: #000;
+        color: #fff;
+      }
+      #ui {
+        position: fixed;
+        left: 12px;
+        top: 12px;
+        z-index: 10;
+        background: rgba(0, 0, 0, 0.65);
+        padding: 10px;
+        border-radius: 10px;
+        width: 240px;
+      }
+      #controls {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      #ui.min {
+        opacity: 0.2;
+      }
+      #ui.min {
+        pointer-events: none;
+      }
+      #ui.min #btnFull,
+      #ui.min #btnSensor {
+        pointer-events: auto;
+      }
+      #ui.min button:not(#btnFull):not(#btnSensor),
+      #ui.min input {
+        display: none;
+      }
+      #ui input {
+        width: 100%;
+        padding: 6px 8px;
+        box-sizing: border-box;
+        font-size: 48px;
+      }
+      button {
+        padding: 6px 10px;
+        margin-top: 8px;
+        width: 100%;
+        font-size: 48px;
+      }
+      #status {
+        font-size: 12px;
+        white-space: pre;
+        margin-top: 8px;
+      }
+      #btnFull {
+        margin-top: 6px;
+      }
+      video {
+        position: fixed;
+        inset: 0;
+        width: 100vw;
+        height: 100vh;
+        object-fit: contain;
+        background: #000;
+        z-index: 0;
+        pointer-events: none;
+      }
+      body.fullscreen #ui {
+        display: none;
+      }
+      body.fullscreen video {
+        object-fit: contain;
+      }
+      @media (orientation: portrait) {
+        #ui {
+          width: calc(100% - 24px);
+        }
+        #controls button {
+          margin-top: 0;
+          padding: 12px 0;
+          font-size: 48px;
+        }
+        #status {
+          display: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="ui">
+      <input id="roomId" value="imu-view" />
+      <div id="controls">
+        <button id="btnJoin">Join Broadcast</button>
+        <button id="btnSensor">Enable Sensors</button>
+        <button id="btnFull">Fullscreen</button>
+      </div>
+      <div id="status">idle v2</div>
+    </div>
+
+    <video id="video" autoplay playsinline muted></video>
+
+    <script>
+      var roomInput = document.getElementById("roomId");
+      var btnJoin = document.getElementById("btnJoin");
+      var btnSensor = document.getElementById("btnSensor");
+      var statusEl = document.getElementById("status");
+      var videoEl = document.getElementById("video");
+      var btnFull = document.getElementById("btnFull");
+      statusEl.textContent = "js loaded v2";
+
+      var signalingUrl = "wss://eokbba.shop";
+      var clientId =
+        (window.crypto &&
+          window.crypto.randomUUID &&
+          window.crypto.randomUUID()) ||
+        Math.random().toString(36).slice(2);
+
+      var ws = null;
+      var wsState = "disconnected";
+      var pc = null;
+      var dc = null;
+      var roomId = "imu";
+      var broadcasterId = null;
+      var hasOffer = false;
+      var readyTimer = null;
+      var msgCount = 0;
+      var lastMsg = "";
+
+      var eventLog = [];
+      var sensorEnabled = false;
+      var sensorSeq = 0;
+      var lastSendTs = 0;
+      var sendIntervalMs = 33;
+      var ori = { alpha: 0, beta: 0, gamma: 0 };
+      var acc = { x: 0, y: 0, z: 0 };
+      var sensorPump = null;
+      var lastSensorEventTs = 0;
+      var lastSensorWarnTs = 0;
+
+      function pushLog(line) {
+        eventLog.push(line);
+        if (eventLog.length > 50) {
+          eventLog.shift();
+        }
+      }
+
+      function updateStatus(extra) {
+        var pcState = "none";
+        var iceState = "none";
+        var dcState = dc ? dc.readyState : "none";
+        var secureState = window.isSecureContext ? "true" : "false";
+        if (pc) {
+          pcState = pc.connectionState || pc.iceConnectionState || "unknown";
+          iceState = pc.iceConnectionState || "unknown";
+        }
+        statusEl.textContent =
+          "ws: " +
+          wsState +
+          "\npc: " +
+          pcState +
+          "\nice: " +
+          iceState +
+          "\ndc: " +
+          dcState +
+          "\nmsg: " +
+          msgCount +
+          "\nsecure: " +
+          secureState +
+          (lastMsg ? "\nlast: " + lastMsg : "") +
+          (eventLog.length ? "\nlog:\n" + eventLog.join("\n") : "") +
+          "\nsensor: " +
+          (sensorEnabled ? "on" : "off");
+        if (extra) {
+          statusEl.textContent += "\n" + extra;
+        }
+      }
+
+      function sendSignal(payload) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        ws.send(
+          JSON.stringify({
+            sender: clientId,
+            viewerId: clientId,
+            room: roomId,
+            type: payload.type,
+            sdp: payload.sdp,
+            candidate: payload.candidate,
+            to: payload.to,
+          }),
+        );
+      }
+
+      function connectSignaling() {
+        if (
+          ws &&
+          (ws.readyState === WebSocket.OPEN ||
+            ws.readyState === WebSocket.CONNECTING)
+        ) {
+          updateStatus("ws already connecting/open");
+          if (ws.readyState === WebSocket.OPEN) {
+            sendSignal({ type: "join" });
+            sendSignal({ type: "ready" });
+          }
+          return;
+        }
+        ws = new WebSocket(signalingUrl);
+        wsState = "connecting";
+        updateStatus();
+        var connectTimer = setTimeout(function () {
+          if (ws && ws.readyState === WebSocket.CONNECTING) {
+            updateStatus("ws timeout");
+            try {
+              ws.close();
+            } catch (e) {}
+          }
+        }, 5000);
+
+        ws.onopen = function () {
+          wsState = "open";
+          clearTimeout(connectTimer);
+          updateStatus();
+          sendSignal({ type: "join" });
+          sendSignal({ type: "ready" });
+          if (readyTimer) {
+            clearInterval(readyTimer);
+          }
+          readyTimer = setInterval(function () {
+            if (!hasOffer && ws && ws.readyState === WebSocket.OPEN) {
+              sendSignal({ type: "ready" });
+              updateStatus("ready retry");
+            }
+          }, 2000);
+        };
+
+        ws.onclose = function () {
+          wsState = "closed";
+          clearTimeout(connectTimer);
+          if (readyTimer) {
+            clearInterval(readyTimer);
+            readyTimer = null;
+          }
+          updateStatus();
+        };
+
+        ws.onerror = function () {
+          wsState = "error";
+          clearTimeout(connectTimer);
+          if (readyTimer) {
+            clearInterval(readyTimer);
+            readyTimer = null;
+          }
+          updateStatus("ws error");
+        };
+
+        ws.onmessage = function (evt) {
+          var msg = null;
+          try {
+            msg = JSON.parse(evt.data);
+          } catch (e) {
+            return;
+          }
+          msgCount += 1;
+          lastMsg =
+            (msg && msg.type ? msg.type : "unknown") +
+            " from " +
+            (msg && msg.sender ? msg.sender : "?");
+          pushLog("msg " + lastMsg);
+          updateStatus();
+          if (!msg || msg.sender === clientId) return;
+          if (msg.room && msg.room !== roomId) return;
+
+          if (msg.type === "hello") {
+            broadcasterId = msg.sender;
+            pushLog("hello recv");
+            updateStatus("hello recv");
+            return;
+          }
+          if (msg.type === "offer" && msg.sdp) {
+            broadcasterId = msg.sender;
+            hasOffer = true;
+            pushLog("offer recv");
+            updateStatus("offer recv");
+            ensurePeer();
+            var rawSdp = msg.sdp;
+            var normalizedSdp = normalizeSdp(msg.sdp);
+            var legacySdp = sanitizeSdpForOldChrome(normalizedSdp);
+            var rawInfo = summarizeSdp(rawSdp);
+            var normInfo = summarizeSdp(normalizedSdp);
+            var legacyInfo = summarizeSdp(legacySdp);
+            pushLog("offer raw: " + rawInfo);
+            pushLog("offer norm: " + normInfo);
+            pushLog("offer leg: " + legacyInfo);
+            logSdpDiagnostics(rawSdp, "raw");
+            logSdpDiagnostics(normalizedSdp, "norm");
+            logSdpDiagnostics(legacySdp, "leg");
+
+            function applyOfferWithSdp(sdpText, label, useFallback, nextLabel) {
+              var sdpToUse = forceSplitSdp(sdpText);
+              return pc
+                .setRemoteDescription({ type: "offer", sdp: sdpToUse })
+                .then(function () {
+                  var legacyConstraints = {
+                    mandatory: { OfferToReceiveVideo: true },
+                  };
+                  try {
+                    return pc.createAnswer(legacyConstraints);
+                  } catch (e) {
+                    return pc.createAnswer();
+                  }
+                })
+                .then(function (answer) {
+                  return pc.setLocalDescription(answer);
+                })
+                .then(function () {
+                  sendSignal({
+                    type: "answer",
+                    sdp: pc.localDescription.sdp,
+                    to: broadcasterId,
+                  });
+                  pushLog("answer sent (" + label + ")");
+                  updateStatus("answer sent");
+                })
+                .catch(function (err) {
+                  var msgText = err && err.message ? err.message : "offer err";
+                  var bad = findInvalidSdpLine(sdpToUse);
+                  if (bad) {
+                    pushLog(label + " bad line: " + bad);
+                  } else {
+                    logSdpSample(sdpToUse, label);
+                  }
+                  pushLog(label + " err: " + msgText);
+                  updateStatus(label + " err");
+                  if (useFallback) {
+                    if (nextLabel === "norm") {
+                      return applyOfferWithSdp(
+                        normalizedSdp,
+                        "norm",
+                        true,
+                        "leg",
+                      );
+                    }
+                    if (nextLabel === "leg") {
+                      return applyOfferWithSdp(legacySdp, "leg", false);
+                    }
+                  }
+                });
+            }
+
+            applyOfferWithSdp(rawSdp, "raw", rawSdp !== normalizedSdp, "norm");
+            return;
+          }
+          if (msg.type === "answer" && msg.sdp) {
+            if (!pc) return;
+            pc.setRemoteDescription({
+              type: "answer",
+              sdp: normalizeSdp(msg.sdp),
+            })
+              .then(function () {
+                pushLog("answer recv");
+                updateStatus("answer recv");
+              })
+              .catch(function (err) {
+                var msgText = err && err.message ? err.message : "answer err";
+                var bad = findInvalidSdpLine(msg.sdp);
+                if (bad) {
+                  pushLog("answer bad line: " + bad);
+                }
+                pushLog("answer err: " + msgText);
+                updateStatus("answer err");
+              });
+            return;
+          }
+          if (msg.type === "ice" && msg.candidate) {
+            if (!pc) return;
+            try {
+              pc.addIceCandidate(msg.candidate);
+            } catch (e) {}
+            pushLog("ice recv");
+            updateStatus("ice recv");
+            if (!hasOffer && ws && ws.readyState === WebSocket.OPEN) {
+              sendSignal({ type: "ready" });
+              pushLog("ready retry");
+              updateStatus("ready retry");
+            }
+            return;
+          }
+        };
+      }
+
+      function normalizeSdp(rawSdp) {
+        if (!rawSdp) return rawSdp;
+        var sdp = String(rawSdp).trim();
+        // Handle SDP passed with escaped newlines (e.g. "\\n" or "\\r\\n")
+        if (sdp.indexOf("\\n") !== -1 || sdp.indexOf("\\r") !== -1) {
+          sdp = sdp
+            .replace(/\\r\\n/g, "\n")
+            .replace(/\\n/g, "\n")
+            .replace(/\\r/g, "\n");
+        }
+        sdp = forceSplitSdp(sdp);
+        var lines = sdp.split(/\r\n/);
+        var filtered = [];
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i];
+          if (!line) continue;
+          if (line.indexOf("a=max-message-size:") === 0) continue;
+          if (line.indexOf("a=extmap-allow-mixed") === 0) continue;
+          if (line.indexOf("a=extmap:") === 0) continue;
+          if (line.indexOf("a=rtcp-rsize") === 0) continue;
+          filtered.push(line);
+        }
+        sdp = filtered.join("\r\n");
+        sdp = sdp.replace(/^a=setup:actpass\r\n?$/gm, "a=setup:active\r\n");
+        return sdp;
+      }
+
+      function findInvalidSdpLine(rawSdp) {
+        if (!rawSdp) return null;
+        var lines = String(rawSdp).split(/\r\n|\n/);
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i];
+          if (!line) continue;
+          if (!/^[a-z]=/.test(line)) {
+            return line;
+          }
+        }
+        return null;
+      }
+
+      function logSdpSample(rawSdp, label) {
+        if (!rawSdp) return;
+        var lines = forceSplitSdp(String(rawSdp)).split(/\r\n|\n/);
+        var sample = [];
+        for (var i = 0; i < lines.length && i < 12; i++) {
+          if (lines[i]) sample.push(lines[i]);
+        }
+        if (sample.length) {
+          pushLog(label + " sdp head:");
+          for (var j = 0; j < sample.length; j++) {
+            pushLog(sample[j]);
+          }
+        }
+      }
+
+      function summarizeSdp(rawSdp) {
+        if (!rawSdp) return "empty";
+        var s = forceSplitSdp(String(rawSdp));
+        var hasLf = s.indexOf("\n") !== -1;
+        var hasCr = s.indexOf("\r") !== -1;
+        var hasEsc = s.indexOf("\\n") !== -1 || s.indexOf("\\r") !== -1;
+        var lineCount = s.split(/\r\n|\n/).filter(Boolean).length;
+        return (
+          "len=" +
+          s.length +
+          " lf=" +
+          hasLf +
+          " cr=" +
+          hasCr +
+          " esc=" +
+          hasEsc +
+          " lines=" +
+          lineCount
+        );
+      }
+
+      function sanitizeSdpForOldChrome(rawSdp) {
+        if (!rawSdp) return rawSdp;
+        var sdp = String(rawSdp);
+        // Ensure line breaks exist before line-based removals.
+        sdp = forceSplitSdp(sdp);
+        sdp = sdp
+          .replace(/^a=extmap-allow-mixed.*(?:\r\n|\r|\n)?/gm, "")
+          .replace(/^a=extmap:.*(?:\r\n|\r|\n)?/gm, "")
+          .replace(/^a=rtcp-rsize.*(?:\r\n|\r|\n)?/gm, "")
+          .replace(/^a=max-message-size:.*(?:\r\n|\r|\n)?/gm, "")
+          .replace(/^a=msid-semantic:.*(?:\r\n|\r|\n)?/gm, "")
+          .replace(/^a=msid:.*(?:\r\n|\r|\n)?/gm, "");
+        return sdp;
+      }
+
+      function forceSplitSdp(rawSdp) {
+        if (!rawSdp) return rawSdp;
+        var sdp = String(rawSdp);
+        sdp = sdp.replace(/\u2028|\u2029/g, "\n");
+        sdp = sdp.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        // Always split if multiple "x=" tokens are on the same line.
+        sdp = sdp.replace(/[ \t\u00a0]+([vosctamb])=/g, "\n$1=");
+        sdp = sdp.replace(/\n+/g, "\n").replace(/\n/g, "\r\n");
+        return sdp;
+      }
+
+      function logSdpDiagnostics(rawSdp, label) {
+        if (!rawSdp) return;
+        var lines = String(rawSdp).split(/\r\n|\n/);
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i];
+          if (!line) continue;
+          if (!/^[a-z]=/.test(line)) {
+            var chars = [];
+            for (var j = 0; j < line.length && j < 12; j++) {
+              chars.push(line.charCodeAt(j).toString(16));
+            }
+            console.log(
+              "[sdp diag]",
+              label,
+              "bad line",
+              i,
+              line,
+              chars.join(" "),
+            );
+            break;
+          }
+        }
+      }
+
+      function ensurePeer() {
+        if (pc) return pc;
+        pc = new RTCPeerConnection({
+          sdpSemantics: "plan-b",
+          iceServers: [
+            { urls: "stun:3.37.140.87:3478" },
+            {
+              urls: [
+                "turn:3.37.140.87:3478?transport=udp",
+                "turn:3.37.140.87:3478?transport=tcp",
+              ],
+              username: "imuuser",
+              credential: "imupass",
+            },
+          ],
+        });
+
+        pc.onicecandidate = function (e) {
+          if (!e.candidate) return;
+          var obj = {
+            candidate: e.candidate.candidate,
+            sdpMLineIndex: e.candidate.sdpMLineIndex,
+            sdpMid: e.candidate.sdpMid,
+          };
+          if (broadcasterId) {
+            sendSignal({ type: "ice", candidate: obj, to: broadcasterId });
+          } else {
+            sendSignal({ type: "ice", candidate: obj });
+          }
+          pushLog("ice sent");
+          updateStatus("ice sent");
+        };
+
+        pc.ontrack = function (e) {
+          if (videoEl.srcObject !== e.streams[0]) {
+            videoEl.srcObject = e.streams[0];
+            try {
+              videoEl.play();
+            } catch (err) {}
+            pushLog("track received");
+            updateStatus("track received");
+          }
+        };
+
+        pc.onaddstream = function (e) {
+          if (videoEl.srcObject !== e.stream) {
+            videoEl.srcObject = e.stream;
+            try {
+              videoEl.play();
+            } catch (err) {}
+            pushLog("stream received");
+            updateStatus("stream received");
+          }
+        };
+
+        pc.ondatachannel = function (e) {
+          dc = e.channel;
+          dc.binaryType = "arraybuffer";
+          dc.onopen = function () {
+            pushLog("dc open");
+            updateStatus("dc open");
+            try {
+              dc.send(new Uint8Array([1]).buffer);
+            } catch (err) {}
+          };
+          dc.onclose = function () {
+            pushLog("dc closed");
+            updateStatus("dc closed");
+          };
+          dc.onerror = function () {
+            pushLog("dc error");
+            updateStatus("dc error");
+          };
+        };
+
+        pc.onconnectionstatechange = function () {
+          updateStatus();
+        };
+        pc.oniceconnectionstatechange = function () {
+          updateStatus();
+        };
+        updateStatus();
+        return pc;
+      }
+
+      function createLocalOffer() {
+        ensurePeer();
+      }
+
+      function packSensorPayload() {
+        var buf = new ArrayBuffer(28);
+        var dv = new DataView(buf);
+        dv.setUint32(0, sensorSeq, true);
+        dv.setFloat32(4, ori.alpha || 0, true);
+        dv.setFloat32(8, ori.beta || 0, true);
+        dv.setFloat32(12, ori.gamma || 0, true);
+        dv.setFloat32(16, acc.x || 0, true);
+        dv.setFloat32(20, acc.y || 0, true);
+        dv.setFloat32(24, acc.z || 0, true);
+        return buf;
+      }
+
+      function maybeSendSensor(now) {
+        if (!sensorEnabled) return;
+        if (!dc || dc.readyState !== "open") return;
+        if (now - lastSendTs < sendIntervalMs) return;
+        if (now - lastSensorEventTs > 1000) {
+          if (now - lastSensorWarnTs > 1000) {
+            lastSensorWarnTs = now;
+            updateStatus("sensor blocked?");
+          }
+          return;
+        }
+        lastSendTs = now;
+        sensorSeq = (sensorSeq + 1) >>> 0;
+        try {
+          dc.send(packSensorPayload());
+        } catch (e) {}
+      }
+
+      function onOrientation(e) {
+        ori.alpha = e.alpha || 0;
+        ori.beta = e.beta || 0;
+        ori.gamma = e.gamma || 0;
+        lastSensorEventTs = performance.now();
+        maybeSendSensor(performance.now());
+      }
+
+      function onMotion(e) {
+        if (e.accelerationIncludingGravity) {
+          acc.x = e.accelerationIncludingGravity.x || 0;
+          acc.y = e.accelerationIncludingGravity.y || 0;
+          acc.z = e.accelerationIncludingGravity.z || 0;
+        } else if (e.acceleration) {
+          acc.x = e.acceleration.x || 0;
+          acc.y = e.acceleration.y || 0;
+          acc.z = e.acceleration.z || 0;
+        }
+        lastSensorEventTs = performance.now();
+        maybeSendSensor(performance.now());
+      }
+
+      function enableSensors() {
+        if (sensorEnabled) return;
+        sensorEnabled = true;
+        updateStatus("sensor enabled");
+        window.addEventListener("deviceorientation", onOrientation, true);
+        window.addEventListener("devicemotion", onMotion, true);
+        if (!sensorPump) {
+          sensorPump = setInterval(function () {
+            maybeSendSensor(performance.now());
+          }, sendIntervalMs);
+        }
+      }
+
+      function joinBroadcast() {
+        roomId = (roomInput && roomInput.value.trim()) || "imu-view";
+        hasOffer = false;
+        msgCount = 0;
+        lastMsg = "";
+        eventLog = [];
+        updateStatus("joining...");
+        document.getElementById("ui").classList.add("min");
+        if (ws && ws.readyState === WebSocket.CLOSING) {
+          try {
+            ws.close();
+          } catch (e) {}
+          ws = null;
+        }
+        if (ws && ws.readyState === WebSocket.CLOSED) {
+          ws = null;
+        }
+        connectSignaling();
+      }
+
+      btnJoin.onclick = joinBroadcast;
+      btnJoin.ontouchstart = function (e) {
+        e.preventDefault();
+        joinBroadcast();
+      };
+
+      btnSensor.onclick = function () {
+        if (
+          typeof DeviceMotionEvent !== "undefined" &&
+          typeof DeviceMotionEvent.requestPermission === "function"
+        ) {
+          DeviceMotionEvent.requestPermission()
+            .then(function (state) {
+              if (state === "granted") {
+                enableSensors();
+              } else {
+                updateStatus("sensor denied");
+              }
+            })
+            .catch(function () {
+              updateStatus("sensor denied");
+            });
+        } else {
+          enableSensors();
+        }
+      };
+
+      function requestFullscreen() {
+        var el = document.documentElement;
+        if (el.requestFullscreen) return el.requestFullscreen();
+        if (el.webkitRequestFullscreen) return el.webkitRequestFullscreen();
+        if (el.msRequestFullscreen) return el.msRequestFullscreen();
+      }
+
+      btnFull.onclick = function () {
+        requestFullscreen();
+      };
+      btnFull.ontouchstart = function (e) {
+        e.preventDefault();
+        requestFullscreen();
+      };
+
+      function autoHideBars() {
+        window.scrollTo(0, 1);
+        setTimeout(function () {
+          window.scrollTo(0, 1);
+        }, 200);
+      }
+      window.addEventListener("load", autoHideBars);
+      window.addEventListener("orientationchange", autoHideBars);
+      document.addEventListener("fullscreenchange", function () {
+        var isFull = !!document.fullscreenElement;
+        document.body.classList.toggle("fullscreen", isFull);
+        if (isFull) {
+          autoHideBars();
+        }
+      });
+
+      window.addEventListener("beforeunload", function () {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.close(1000, "page unload");
+        }
+        if (dc) {
+          try {
+            dc.close();
+          } catch (e) {}
+        }
+        if (pc) {
+          try {
+            pc.close();
+          } catch (e) {}
+        }
+        if (sensorPump) {
+          clearInterval(sensorPump);
+          sensorPump = null;
+        }
+        window.removeEventListener("deviceorientation", onOrientation, true);
+        window.removeEventListener("devicemotion", onMotion, true);
+      });
+
+      updateStatus();
+      updateStatus();
+    </script>
+  </body>
+</html>
