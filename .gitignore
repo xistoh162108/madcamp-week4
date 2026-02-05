@@ -23,3 +23,7 @@ Visualizer/.env
 /[Uu]ser[Ss]ettings/
 
 *.pem
+*.glb
+
+*/*.glbwebRTCdemo/donggenWithLigging1.glb
+webRTCdemo/donggenWithLigging2.glb

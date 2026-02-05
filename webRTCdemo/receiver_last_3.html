@@ -1,0 +1,2338 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>WebRTC IMU Receiver (Role-Based) + Three.js</title>
+    <style>
+      body {
+        margin: 0;
+        font-family:
+          system-ui,
+          -apple-system,
+          sans-serif;
+      }
+      #ui {
+        position: fixed;
+        left: 12px;
+        top: 12px;
+        z-index: 10;
+        background: rgba(255, 255, 255, 0.92);
+        padding: 10px;
+        border-radius: 10px;
+        width: calc(100% - 24px);
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+      }
+      #ui.collapsed {
+        background: transparent;
+        box-shadow: none;
+        padding: 0;
+      }
+      #ui.collapsed
+        > :not(#btnToggleUI):not(#btnTogglePose):not(.ui-buttons):not(
+          #poseControls
+        ) {
+        display: none;
+      }
+      .ui-buttons {
+        position: fixed;
+        right: 16px;
+        bottom: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        justify-content: flex-end;
+        z-index: 20;
+      }
+      #btnToggleUI,
+      #btnTogglePose {
+        padding: 4px 8px;
+        font-size: 12px;
+      }
+      #ui input {
+        width: 100%;
+        padding: 6px 8px;
+        box-sizing: border-box;
+      }
+      #ui input.hidden {
+        display: none;
+      }
+      textarea {
+        width: 100%;
+        height: 90px;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin: 6px 0;
+      }
+      button {
+        padding: 6px 10px;
+      }
+      #stats {
+        font-size: 12px;
+        white-space: pre;
+        background: #f6f6f6;
+        padding: 8px;
+        border-radius: 8px;
+      }
+      #stats.hidden {
+        display: none;
+      }
+      #poseControls {
+        position: fixed;
+        right: 12px;
+        top: 12px;
+        width: 280px;
+        max-height: calc(100vh - 24px);
+        overflow: auto;
+        background: rgba(255, 255, 255, 0.92);
+        padding: 10px;
+        border-radius: 10px;
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+      }
+      #poseControls.hidden {
+        display: none;
+      }
+      canvas {
+        display: block;
+      }
+      .qr-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .qr-card {
+        background: #fff;
+        border-radius: 8px;
+        padding: 8px;
+        border: 1px solid #e5e5e5;
+      }
+      .qr-card h4 {
+        margin: 0 0 6px 0;
+        font-size: 13px;
+      }
+      .qr-card canvas,
+      .qr-card img {
+        width: 100%;
+        height: auto;
+        display: block;
+      }
+      .qr-box {
+        width: 100%;
+      }
+      .qr-text {
+        margin-top: 6px;
+        font-size: 11px;
+        word-break: break-all;
+        color: #333;
+      }
+      .qr-code {
+        margin: 4px 0 6px;
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="ui">
+      <div class="ui-buttons">
+        <button id="btnToggleUI">Hide QR</button>
+        <button id="btnTogglePose">Hide Pose</button>
+        <button id="btnCalibrate">Zero (1-shot)</button>
+        <button id="btnCaptureRef">Capture Ref Pose</button>
+      </div>
+      <div class="row qr-grid">
+        <div class="qr-card">
+          <h4>Sensor QR (iOS)</h4>
+          <div id="qrSensor" class="qr-box"></div>
+          <div id="qrTextSensor" class="qr-text" style="display: none"></div>
+          <div id="qrStatusSensor" class="qr-text">Not connected</div>
+        </div>
+        <div class="qr-card">
+          <h4>VisionPro</h4>
+          <div id="qrCodeEnemy" class="qr-code"></div>
+          <div id="qrStatusEnemy" class="qr-text">Not connected</div>
+        </div>
+        <div class="qr-card">
+          <h4>Viewer QR (Browser)</h4>
+          <div id="qrView" class="qr-box"></div>
+          <div id="qrTextView" class="qr-text" style="display: none"></div>
+          <div id="qrStatusView" class="qr-text">Not connected</div>
+        </div>
+      </div>
+      <div class="row">
+        <input id="roomIdSensor" class="hidden" value="imu-data" />
+        <input id="roomIdView" class="hidden" value="imu-view" />
+        <input id="roomIdEnemy" class="hidden" value="" />
+      </div>
+      <div id="stats" class="hidden">waiting...</div>
+      <div id="poseControls"></div>
+    </div>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+        }
+      }
+    </script>
+    <script src="./vendor/qrcode.min.js"></script>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { GLTFLoader } from "https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+
+      // ---------- Three.js scene ----------
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.domElement.setAttribute("tabindex", "0");
+      renderer.domElement.style.outline = "none";
+      document.body.appendChild(renderer.domElement);
+
+      const bcastCanvas = document.createElement("canvas");
+      bcastCanvas.style.display = "none";
+      document.body.appendChild(bcastCanvas);
+      const bcastRenderer = new THREE.WebGLRenderer({
+        antialias: true,
+        canvas: bcastCanvas,
+      });
+      bcastRenderer.setSize(window.innerWidth, window.innerHeight);
+
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(
+        60,
+        window.innerWidth / window.innerHeight,
+        0.01,
+        100,
+      );
+      camera.position.set(0, 1.7, 3);
+      const handGroup = new THREE.Group();
+      handGroup.position.set(0, 0, -0.35);
+      camera.add(handGroup);
+      camera.rotation.order = "YXZ";
+      const degToRad = Math.PI / 180;
+      let sensorOri = { alpha: 0, beta: 0, gamma: 0 };
+      let sensorAcc = { x: 0, y: 0, z: 0 };
+      let sensorHasOri = false;
+      let lastOriUpdate = 0;
+      const oriEuler = new THREE.Euler(0, 0, 0, "YXZ");
+      const q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
+      const q0 = new THREE.Quaternion();
+      const zee = new THREE.Vector3(0, 0, 1);
+      const screenOffset = -Math.PI / 2;
+      const enemyBaseOffset = new THREE.Vector3(0, 0, -2);
+      const modelOffset = new THREE.Vector3(0.09, 0, 0.18);
+      function getEnemyBasePosition() {
+        return enemyBaseOffset.clone();
+      }
+      const stereo = new THREE.StereoCamera();
+      stereo.eyeSep = 0.064;
+      let sbsEnabled = false;
+      let bcastSbsEnabled = false;
+      const keys = {};
+      let lastMoveLogTime = 0;
+      const moveSpeed = 0.03;
+
+      scene.add(new THREE.HemisphereLight(undefined, undefined, 1.0));
+      const dir = new THREE.DirectionalLight(undefined, 1.0);
+      dir.position.set(3, 4, 2);
+      scene.add(dir);
+
+      const grid = new THREE.GridHelper(6, 12);
+      scene.add(grid);
+      // Axes helper hidden
+
+      const debugPoints = {};
+      const debugPointMat = new THREE.MeshStandardMaterial({ color: 0xff4444 });
+      function ensurePoint(name, color) {
+        if (debugPoints[name]) return debugPoints[name];
+        const mat = color
+          ? new THREE.MeshStandardMaterial({ color })
+          : debugPointMat;
+        const mesh = new THREE.Mesh(
+          new THREE.SphereGeometry(0.02, 12, 12),
+          mat,
+        );
+        mesh.name = name;
+        scene.add(mesh);
+        debugPoints[name] = mesh;
+        return mesh;
+      }
+
+      const baseArmDir = new THREE.Vector3(0, -1, 0);
+      const tmpVec = new THREE.Vector3();
+      const tmpVec2 = new THREE.Vector3();
+      const tmpQuat = new THREE.Quaternion();
+      function applyArmIK(
+        armGroup,
+        elbowGroup,
+        shoulderWorld,
+        elbowWorld,
+        wristWorld,
+        elbowFlip,
+      ) {
+        if (!armGroup || !elbowGroup) return;
+        skeletonRoot.updateMatrixWorld(true);
+        armGroup.parent.updateMatrixWorld(true);
+        const shoulderLocal = skeletonRoot.worldToLocal(shoulderWorld.clone());
+        const elbowLocal = skeletonRoot.worldToLocal(elbowWorld.clone());
+        tmpVec.copy(elbowLocal).sub(shoulderLocal);
+        if (tmpVec.lengthSq() < 1e-6) return;
+        tmpVec.normalize();
+        tmpQuat.setFromUnitVectors(baseArmDir, tmpVec);
+        tmpQuat.normalize();
+        armGroup.quaternion.copy(tmpQuat).normalize();
+
+        armGroup.updateMatrixWorld(true);
+        const elbowInArm = armGroup.worldToLocal(elbowWorld.clone());
+        const wristInArm = armGroup.worldToLocal(wristWorld.clone());
+        tmpVec2.copy(wristInArm).sub(elbowInArm);
+        if (tmpVec2.lengthSq() < 1e-6) return;
+        tmpVec2.normalize();
+        if (elbowFlip) tmpVec2.negate();
+        tmpQuat.setFromUnitVectors(baseArmDir, tmpVec2);
+        tmpQuat.normalize();
+        elbowGroup.quaternion.copy(tmpQuat).normalize();
+      }
+
+      function setBoneWorldPosition(bone, worldPos) {
+        if (!bone || !bone.parent) return;
+        bone.parent.updateMatrixWorld(true);
+        const local = bone.parent.worldToLocal(worldPos.clone());
+        bone.position.copy(local);
+      }
+
+      function applyArmNoElbow(
+        armGroup,
+        elbowGroup,
+        shoulderWorld,
+        wristWorld,
+        palmFwdWorld,
+      ) {
+        if (!armGroup || !elbowGroup) return;
+        skeletonRoot.updateMatrixWorld(true);
+        armGroup.parent.updateMatrixWorld(true);
+        const shoulderLocal = skeletonRoot.worldToLocal(shoulderWorld.clone());
+        const wristLocal = skeletonRoot.worldToLocal(wristWorld.clone());
+        tmpVec.copy(wristLocal).sub(shoulderLocal);
+        if (tmpVec.lengthSq() < 1e-6) return;
+        tmpVec.normalize();
+        tmpQuat.setFromUnitVectors(baseArmDir, tmpVec);
+        tmpQuat.normalize();
+        armGroup.quaternion.copy(tmpQuat).normalize();
+
+        if (!palmFwdWorld) return;
+        armGroup.updateMatrixWorld(true);
+        const palmFwdEnd = palmFwdWorld.clone().add(wristWorld);
+        const palmInArm = armGroup.worldToLocal(palmFwdEnd);
+        const wristInArm = armGroup.worldToLocal(wristWorld.clone());
+        tmpVec2.copy(palmInArm).sub(wristInArm);
+        if (tmpVec2.lengthSq() < 1e-6) return;
+        tmpVec2.normalize();
+        tmpQuat.setFromUnitVectors(baseArmDir, tmpVec2);
+        tmpQuat.normalize();
+        elbowGroup.quaternion.copy(tmpQuat).normalize();
+      }
+
+      // ---------- Simple skeleton (head/torso/arms/legs) ----------
+      const skeletonRoot = new THREE.Group();
+      scene.add(skeletonRoot);
+
+      const matBody = new THREE.MeshStandardMaterial({ color: 0x6aa6ff });
+      const matHead = new THREE.MeshStandardMaterial({ color: 0xffd4a3 });
+      const matLimb = new THREE.MeshStandardMaterial({ color: 0x9bd18b });
+
+      const torso = new THREE.Mesh(
+        new THREE.BoxGeometry(0.4, 0.6, 0.2),
+        matBody,
+      );
+      torso.position.set(0, 1.2, 0);
+      skeletonRoot.add(torso);
+      const skeletonMeshes = [torso];
+
+      const headGroup = new THREE.Group();
+      headGroup.position.set(0, 1.6, 0);
+      skeletonRoot.add(headGroup);
+      const head = new THREE.Mesh(
+        new THREE.SphereGeometry(0.18, 16, 12),
+        matHead,
+      );
+      head.position.set(0, 0.18, 0);
+      headGroup.add(head);
+      skeletonMeshes.push(head);
+
+      const leftArmGroup = new THREE.Group();
+      leftArmGroup.position.set(-0.3, 1.45, 0);
+      skeletonRoot.add(leftArmGroup);
+      const leftUpperArm = new THREE.Mesh(
+        new THREE.BoxGeometry(0.15, 0.32, 0.15),
+        matLimb,
+      );
+      leftUpperArm.position.set(0, -0.16, 0);
+      leftArmGroup.add(leftUpperArm);
+      skeletonMeshes.push(leftUpperArm);
+      const leftElbowGroup = new THREE.Group();
+      leftElbowGroup.position.set(0, -0.32, 0);
+      leftArmGroup.add(leftElbowGroup);
+      const leftForearm = new THREE.Mesh(
+        new THREE.BoxGeometry(0.14, 0.32, 0.14),
+        matLimb,
+      );
+      leftForearm.position.set(0, -0.16, 0);
+      leftElbowGroup.add(leftForearm);
+      skeletonMeshes.push(leftForearm);
+
+      const rightArmGroup = new THREE.Group();
+      rightArmGroup.position.set(0.3, 1.45, 0);
+      skeletonRoot.add(rightArmGroup);
+      const rightUpperArm = new THREE.Mesh(
+        new THREE.BoxGeometry(0.15, 0.32, 0.15),
+        matLimb,
+      );
+      rightUpperArm.position.set(0, -0.16, 0);
+      rightArmGroup.add(rightUpperArm);
+      skeletonMeshes.push(rightUpperArm);
+      const rightElbowGroup = new THREE.Group();
+      rightElbowGroup.position.set(0, -0.32, 0);
+      rightArmGroup.add(rightElbowGroup);
+      const rightForearm = new THREE.Mesh(
+        new THREE.BoxGeometry(0.14, 0.32, 0.14),
+        matLimb,
+      );
+      rightForearm.position.set(0, -0.16, 0);
+      rightElbowGroup.add(rightForearm);
+      skeletonMeshes.push(rightForearm);
+
+      const leftLegGroup = new THREE.Group();
+      leftLegGroup.position.set(-0.11, 0.9, 0);
+      skeletonRoot.add(leftLegGroup);
+      const leftLeg = new THREE.Mesh(
+        new THREE.BoxGeometry(0.18, 0.6, 0.18),
+        matLimb,
+      );
+      leftLeg.position.set(0, -0.3, 0);
+      leftLegGroup.add(leftLeg);
+      skeletonMeshes.push(leftLeg);
+
+      const rightLegGroup = new THREE.Group();
+      rightLegGroup.position.set(0.11, 0.9, 0);
+      skeletonRoot.add(rightLegGroup);
+      const rightLeg = new THREE.Mesh(
+        new THREE.BoxGeometry(0.18, 0.6, 0.18),
+        matLimb,
+      );
+      rightLeg.position.set(0, -0.3, 0);
+      rightLegGroup.add(rightLeg);
+      skeletonMeshes.push(rightLeg);
+
+      const useRiggedModel = true;
+      // Hide simple skeleton meshes but keep the transform hierarchy.
+      skeletonMeshes.forEach((m) => {
+        m.visible = useRiggedModel ? false : true;
+      });
+      // Rigged model bindings (optional)
+      let riggedModel = null;
+      const riggedBones = {
+        hips: null,
+        spine: null,
+        head: null,
+        leftUpperArm: null,
+        leftLowerArm: null,
+        rightUpperArm: null,
+        rightLowerArm: null,
+        rightHand: null,
+        leftLeg: null,
+        rightLeg: null,
+      };
+
+      function findBoneByNames(root, names) {
+        let found = null;
+        const lowerNames = names.map((n) => n.toLowerCase());
+        root.traverse((obj) => {
+          if (found || !obj.isBone || !obj.name) return;
+          const n = obj.name.toLowerCase();
+          if (lowerNames.includes(n)) {
+            found = obj;
+          }
+        });
+        return found;
+      }
+
+      const poseOffsetDeg = {
+        bodyYaw: 135,
+        headPitch: 7,
+        leftArmPitch: 100,
+        leftArmYaw: -151,
+        leftArmAbd: 85,
+        leftElbowPitch: -71,
+        rightArmPitch: -90,
+        rightArmYaw: 348,
+        rightArmAbd: 284,
+        rightElbowPitch: 0,
+        leftLegPitch: 0,
+        rightLegPitch: 0,
+      };
+      let lastPoseRad = null;
+
+      function applyPoseWithOffsets(pose) {
+        const bodyYawOffset = (poseOffsetDeg.bodyYaw * Math.PI) / 180;
+        const headPitchOffset = (poseOffsetDeg.headPitch * Math.PI) / 180;
+        const leftArmPitchOffset = (poseOffsetDeg.leftArmPitch * Math.PI) / 180;
+        const leftArmYawOffset = (poseOffsetDeg.leftArmYaw * Math.PI) / 180;
+        const leftArmAbdOffset = (poseOffsetDeg.leftArmAbd * Math.PI) / 180;
+        const leftElbowPitchOffset =
+          (poseOffsetDeg.leftElbowPitch * Math.PI) / 180;
+        const rightArmPitchOffset =
+          (poseOffsetDeg.rightArmPitch * Math.PI) / 180;
+        const rightArmYawOffset = (poseOffsetDeg.rightArmYaw * Math.PI) / 180;
+        const rightArmAbdOffset = (poseOffsetDeg.rightArmAbd * Math.PI) / 180;
+        const rightElbowPitchOffset =
+          (poseOffsetDeg.rightElbowPitch * Math.PI) / 180;
+        const leftLegPitchOffset = (poseOffsetDeg.leftLegPitch * Math.PI) / 180;
+        const rightLegPitchOffset =
+          (poseOffsetDeg.rightLegPitch * Math.PI) / 180;
+
+        skeletonRoot.rotation.y = (pose.bodyYaw || 0) + bodyYawOffset;
+        headGroup.rotation.z = (pose.headPitch || 0) + headPitchOffset;
+        leftArmGroup.rotation.x =
+          (pose.rightArmPitch || 0) + leftArmPitchOffset;
+        leftArmGroup.rotation.y = (pose.rightArmYaw || 0) + leftArmYawOffset;
+        leftArmGroup.rotation.z = (pose.rightArmAbd || 0) + leftArmAbdOffset;
+        leftElbowGroup.rotation.x =
+          (pose.rightElbowPitch || 0) + leftElbowPitchOffset;
+        rightArmGroup.rotation.x =
+          (pose.leftArmPitch || 0) + rightArmPitchOffset;
+        rightArmGroup.rotation.y = (pose.leftArmYaw || 0) + rightArmYawOffset;
+        rightArmGroup.rotation.z = (pose.leftArmAbd || 0) + rightArmAbdOffset;
+        rightElbowGroup.rotation.x =
+          (pose.leftElbowPitch || 0) + rightElbowPitchOffset;
+        leftLegGroup.rotation.x = (pose.leftLegPitch || 0) + leftLegPitchOffset;
+        rightLegGroup.rotation.x =
+          (pose.rightLegPitch || 0) + rightLegPitchOffset;
+      }
+
+      function applyBodyHeadFromFwd(bodyYaw, headPitch) {
+        const bodyYawOffset = (poseOffsetDeg.bodyYaw * Math.PI) / 180;
+        const headPitchOffset = (poseOffsetDeg.headPitch * Math.PI) / 180;
+        const yawAdj = refEnemyPos ? bodyYaw - refEnemyYaw : bodyYaw;
+        skeletonRoot.rotation.y = yawAdj + bodyYawOffset;
+        headGroup.rotation.z = headPitch + headPitchOffset;
+      }
+
+      // Apply default pose offsets immediately on load.
+      applyPoseWithOffsets({});
+
+      function syncRiggedFromSkeleton() {
+        if (!riggedModel) return;
+        if (riggedBones.head)
+          riggedBones.head.rotation.x = headGroup.rotation.x;
+        if (riggedBones.leftUpperArm) {
+          riggedBones.leftUpperArm.rotation.x = leftArmGroup.rotation.x;
+          riggedBones.leftUpperArm.rotation.y = leftArmGroup.rotation.y;
+          riggedBones.leftUpperArm.rotation.z = leftArmGroup.rotation.z;
+        }
+        if (riggedBones.leftLowerArm) {
+          riggedBones.leftLowerArm.rotation.x = leftElbowGroup.rotation.x;
+        }
+        if (riggedBones.rightUpperArm) {
+          riggedBones.rightUpperArm.rotation.x = rightArmGroup.rotation.x;
+          riggedBones.rightUpperArm.rotation.y = rightArmGroup.rotation.y;
+          riggedBones.rightUpperArm.rotation.z = rightArmGroup.rotation.z;
+        }
+        if (riggedBones.rightLowerArm) {
+          riggedBones.rightLowerArm.rotation.x = rightElbowGroup.rotation.x;
+        }
+        if (riggedBones.leftLeg) {
+          riggedBones.leftLeg.rotation.x = 0;
+          riggedBones.leftLeg.rotation.z = leftLegGroup.rotation.x + Math.PI;
+        }
+        if (riggedBones.rightLeg) {
+          riggedBones.rightLeg.rotation.x = 0;
+          riggedBones.rightLeg.rotation.z = rightLegGroup.rotation.x + Math.PI;
+        }
+        if (riggedBones.hips) {
+          riggedBones.hips.rotation.y = skeletonRoot.rotation.y;
+        } else if (riggedBones.spine) {
+          riggedBones.spine.rotation.y = skeletonRoot.rotation.y;
+        }
+      }
+
+      function buildPoseControls() {
+        const items = [
+          ["bodyYaw", "Body Yaw Offset", -360, 360],
+          ["headPitch", "Head Pitch Offset", -360, 360],
+          ["leftArmPitch", "Left Arm Pitch Offset", -360, 360],
+          ["leftArmYaw", "Left Arm Yaw Offset", -360, 360],
+          ["leftArmAbd", "Left Arm Abduction Offset", -360, 360],
+          ["leftElbowPitch", "Left Elbow Pitch Offset", -360, 360],
+          ["rightArmPitch", "Right Arm Pitch Offset", -360, 360],
+          ["rightArmYaw", "Right Arm Yaw Offset", -360, 360],
+          ["rightArmAbd", "Right Arm Abduction Offset", -360, 360],
+          ["rightElbowPitch", "Right Elbow Pitch Offset", -360, 360],
+        ];
+        const frag = document.createDocumentFragment();
+        items.forEach(([key, label, min, max]) => {
+          const wrap = document.createElement("div");
+          wrap.style.margin = "6px 0";
+          const title = document.createElement("div");
+          const valueSpan = document.createElement("span");
+          valueSpan.style.marginLeft = "6px";
+          valueSpan.textContent = String(poseOffsetDeg[key]);
+          title.textContent = label + " (" + key + ") ";
+          title.appendChild(valueSpan);
+          title.style.fontSize = "12px";
+          const input = document.createElement("input");
+          input.type = "range";
+          input.min = String(min);
+          input.max = String(max);
+          input.step = "1";
+          input.value = String(poseOffsetDeg[key]);
+          input.style.width = "100%";
+          input.style.margin = "0";
+          input.addEventListener("input", () => {
+            poseOffsetDeg[key] = Number(input.value);
+            valueSpan.textContent = String(poseOffsetDeg[key]);
+            applyPoseWithOffsets(lastPoseRad || {});
+          });
+          wrap.appendChild(title);
+          wrap.appendChild(input);
+          frag.appendChild(wrap);
+        });
+        poseControlsEl.appendChild(frag);
+      }
+
+      const sensorState1 = {
+        lastSeq: 0,
+        lastT: 0,
+        lastPos: [0, 0, 0],
+        lastQuat: [0, 0, 0, 1],
+        poseObject: null,
+      };
+      let enemySceneSeq = 0;
+      const enemyState = {
+        lastSeq: 0,
+        lastT: 0,
+        lastPos: [0, 0, 0],
+        lastQuat: [0, 0, 0, 1],
+        poseObject: null,
+      };
+
+      let poseObject = handGroup;
+      let sensorSaber = null;
+      // skeletonRoot.position.set(0.39, 0.0, -10.98).add(modelOffset);
+      skeletonRoot.position
+        .set(0, 0.95, 0)
+        .add(getEnemyBasePosition())
+        .add(modelOffset);
+
+      sensorState1.poseObject = poseObject;
+      enemyState.poseObject = null;
+
+      // Load rigged character model (driven by skeleton groups)
+      const loader = new GLTFLoader();
+      if (useRiggedModel) {
+        loader.load(
+          "./donggenWithLigging2.glb",
+          (gltf) => {
+            const model = gltf.scene;
+            model.position.set(0, 0, 0);
+            model.scale.set(1.0, 1.0, 1.0);
+            skeletonRoot.add(model);
+            riggedModel = model;
+            // keep sensor-driven pose on handGroup; rigged model uses enemy packets
+            // rigged model loaded
+            riggedBones.spine = findBoneByNames(model, ["Spine"]);
+            riggedBones.head = findBoneByNames(model, ["head"]);
+            riggedBones.leftUpperArm = findBoneByNames(model, ["l_upperarm"]);
+            riggedBones.leftLowerArm = findBoneByNames(model, ["l_forearm"]);
+            riggedBones.rightUpperArm = findBoneByNames(model, ["r_upperarm"]);
+            riggedBones.rightLowerArm = findBoneByNames(model, ["r_forearm"]);
+            riggedBones.leftLeg = findBoneByNames(model, ["l_leg"]);
+            riggedBones.rightLeg = findBoneByNames(model, ["r_leg"]);
+          },
+          undefined,
+          (err) => {
+            console.error("Failed to load rigged model", err);
+          },
+        );
+      }
+
+      let saberRigged = null;
+      loader.load(
+        "./lightsaber1.glb",
+        (gltf) => {
+          const saber = gltf.scene;
+          saberRigged = saber;
+          saber.name = "lightsaber_rigged_hand";
+          saber.visible = true;
+          saber.traverse((obj) => {
+            if (obj.isMesh) {
+              obj.frustumCulled = false;
+              obj.visible = true;
+            }
+          });
+          saber.scale.set(1, 1, 1);
+          saber.position.set(0, 0, 0);
+          saber.rotation.set(0, 0, 0);
+          scene.add(saber);
+        },
+        undefined,
+        (err) => {
+          console.error("Failed to load fixed lightsaber model", err);
+        },
+      );
+
+      // Sensor-controlled lightsaber (follows sensor pose)
+      loader.load(
+        "./lightsaber2.glb",
+        (gltf) => {
+          const saber = gltf.scene;
+          saber.name = "lightsaber_sensor_hand";
+          saber.visible = true;
+          saber.traverse((obj) => {
+            if (obj.isMesh) {
+              obj.frustumCulled = false;
+              obj.visible = true;
+            }
+          });
+          scene.add(saber);
+          saber.scale.set(1, 1, 1);
+          saber.position.set(0, 0, 0);
+          saber.rotation.x = Math.PI / 2;
+          sensorSaber = saber;
+          sensorState1.poseObject = sensorSaber;
+        },
+        undefined,
+        (err) => {
+          console.error("Failed to load sensor lightsaber model", err);
+        },
+      );
+
+      window.addEventListener("resize", () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        bcastRenderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      function renderSbs(targetRenderer) {
+        const size = targetRenderer.getSize(new THREE.Vector2());
+        const w = size.x;
+        const h = size.y;
+        const halfW = Math.floor(w / 2);
+
+        stereo.update(camera);
+        targetRenderer.setScissorTest(true);
+
+        targetRenderer.setViewport(0, 0, halfW, h);
+        targetRenderer.setScissor(0, 0, halfW, h);
+        targetRenderer.render(scene, stereo.cameraL);
+
+        targetRenderer.setViewport(halfW, 0, w - halfW, h);
+        targetRenderer.setScissor(halfW, 0, w - halfW, h);
+        targetRenderer.render(scene, stereo.cameraR);
+
+        targetRenderer.setScissorTest(false);
+      }
+
+      function animate() {
+        let moved = false;
+        if (keys["w"]) {
+          skeletonRoot.position.z -= moveSpeed;
+          moved = true;
+        }
+        if (keys["s"]) {
+          skeletonRoot.position.z += moveSpeed;
+          moved = true;
+        }
+        if (keys["a"]) {
+          skeletonRoot.position.x -= moveSpeed;
+          moved = true;
+        }
+        if (keys["d"]) {
+          skeletonRoot.position.x += moveSpeed;
+          moved = true;
+        }
+        if (moved) {
+          const now = performance.now();
+          if (!lastMoveLogTime || now - lastMoveLogTime > 200) {
+            lastMoveLogTime = now;
+            const p = skeletonRoot.position;
+            console.log(
+              "[pos]",
+              p.x.toFixed(3),
+              p.y.toFixed(3),
+              p.z.toFixed(3),
+            );
+          }
+        }
+        const t = performance.now() * 0.008;
+        const legAmp = (20 * Math.PI) / 180;
+        leftLegGroup.rotation.x = Math.sin(t) * legAmp;
+        rightLegGroup.rotation.x = Math.sin(t + Math.PI) * legAmp;
+        syncRiggedFromSkeleton();
+        if (sensorHasOri) {
+          const beta = sensorOri.beta * degToRad;
+          const alpha = sensorOri.alpha * degToRad;
+          const gamma = sensorOri.gamma * degToRad;
+          oriEuler.set(beta, alpha, -gamma);
+          camera.quaternion.setFromEuler(oriEuler);
+          camera.quaternion.multiply(q1);
+          camera.quaternion.multiply(q0.setFromAxisAngle(zee, screenOffset));
+          camera.quaternion.normalize();
+          camera.updateMatrixWorld(true);
+          if (performance.now() - lastOriUpdate < 500) {
+            console.log(
+              "[cam]",
+              "rot",
+              camera.rotation.x.toFixed(3),
+              camera.rotation.y.toFixed(3),
+              camera.rotation.z.toFixed(3),
+            );
+          }
+        }
+        if (sbsEnabled) {
+          renderSbs(renderer);
+        } else {
+          renderer.render(scene, camera);
+        }
+        if (bcastSbsEnabled) {
+          renderSbs(bcastRenderer);
+        }
+        requestAnimationFrame(animate);
+      }
+      animate();
+
+      function keyDown(e) {
+        keys[e.key.toLowerCase()] = true;
+        const p = skeletonRoot.position;
+        // console.log("[pos]", p.x.toFixed(3), p.y.toFixed(3), p.z.toFixed(3));
+      }
+      function keyUp(e) {
+        keys[e.key.toLowerCase()] = false;
+        const p = skeletonRoot.position;
+        // console.log("[pos]", p.x.toFixed(3), p.y.toFixed(3), p.z.toFixed(3));
+      }
+      window.addEventListener("keydown", keyDown);
+      window.addEventListener("keyup", keyUp);
+      document.addEventListener("keydown", keyDown);
+      document.addEventListener("keyup", keyUp);
+      window.addEventListener("click", () => {
+        renderer.domElement.focus();
+      });
+      window.addEventListener("load", () => {
+        document.body.setAttribute("tabindex", "0");
+        document.body.focus();
+      });
+
+      // ---------- WebRTC / UI ----------
+      const offerOut = null;
+      const answerIn = null;
+      const iceOut = null;
+      const iceIn = null;
+      const statsEl = document.getElementById("stats");
+      const poseControlsEl = document.getElementById("poseControls");
+      const roomInputSensor = document.getElementById("roomIdSensor");
+      const roomInputView = document.getElementById("roomIdView");
+      const roomInputEnemy = document.getElementById("roomIdEnemy");
+      const qrSensorEl = document.getElementById("qrSensor");
+      const qrViewEl = document.getElementById("qrView");
+      const qrTextSensor = document.getElementById("qrTextSensor");
+      const qrTextView = document.getElementById("qrTextView");
+      const qrStatusSensor = document.getElementById("qrStatusSensor");
+      const qrStatusView = document.getElementById("qrStatusView");
+      const qrStatusEnemy = document.getElementById("qrStatusEnemy");
+      const qrCodeEnemy = document.getElementById("qrCodeEnemy");
+      const btnCalibrate = document.getElementById("btnCalibrate");
+      const btnCaptureRef = document.getElementById("btnCaptureRef");
+      const btnToggleUI = document.getElementById("btnToggleUI");
+      const btnTogglePose = document.getElementById("btnTogglePose");
+      const uiEl = document.getElementById("ui");
+
+      const broadcastFPS = 30;
+
+      const signalingUrl = "wss://eokbba.shop";
+      const clientId =
+        (crypto && crypto.randomUUID && crypto.randomUUID()) ||
+        Math.random().toString(36).slice(2);
+
+      function randId(prefix) {
+        return (
+          prefix +
+          "-" +
+          Math.random().toString(36).slice(2, 10) +
+          Math.random().toString(36).slice(2, 6)
+        );
+      }
+      function randCode8() {
+        const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        let out = "";
+        for (let i = 0; i < 8; i++) {
+          out += chars[Math.floor(Math.random() * chars.length)];
+        }
+        return out;
+      }
+
+      let lastEnemyDecoded = null;
+      let lastEnemyPoseRadRaw = null;
+      const refPoseRaw = {
+        leftArmPitch: 0,
+        leftArmYaw: 0,
+        leftArmAbd: 0,
+        leftElbowPitch: 0,
+        rightArmPitch: 0,
+        rightArmYaw: 0,
+        rightArmAbd: 0,
+        rightElbowPitch: 0,
+      };
+      let refEnemyPos = null;
+      let refEnemyYaw = 0;
+
+      function alignEnemyPose(d) {
+        return { ...d };
+      }
+
+      let refPose = alignEnemyPose(refPoseRaw);
+
+      function initRoomsFromUrl() {
+        const params = new URLSearchParams(window.location.search);
+        const sensorRoom = params.get("sensor") || randId("imu-data");
+        const viewRoom = params.get("view") || randId("imu-view");
+        // const enemyRoom = params.get("enemy") || randCode8();
+        const enemyRoom = "NHRQJ4DN";
+        roomInputSensor.value = sensorRoom;
+        roomInputView.value = viewRoom;
+        if (roomInputEnemy) roomInputEnemy.value = enemyRoom;
+        return { sensorRoom, viewRoom, enemyRoom };
+      }
+
+      function renderQr(el, text) {
+        if (!el || !window.QRCode) return false;
+        try {
+          while (el.firstChild) el.removeChild(el.firstChild);
+          new window.QRCode(el, {
+            text: text,
+            width: 220,
+            height: 220,
+            correctLevel: window.QRCode.CorrectLevel.M,
+          });
+          return true;
+        } catch (e) {}
+        return false;
+      }
+
+      function setupQr() {
+        const rooms = initRoomsFromUrl();
+        const sensorPayload = "room=" + encodeURIComponent(rooms.sensorRoom);
+        const baseHref = location.href.split("?")[0];
+        const viewerUrl =
+          baseHref.replace("receiver_last_2.html", "viewer_last_2.html") +
+          "?room=" +
+          encodeURIComponent(rooms.viewRoom);
+        const ok1 = renderQr(qrSensorEl, sensorPayload);
+        const ok2 = renderQr(qrViewEl, viewerUrl);
+        if (qrTextSensor) qrTextSensor.textContent = "";
+        if (qrTextView) qrTextView.textContent = "";
+        if (qrCodeEnemy) qrCodeEnemy.textContent = rooms.enemyRoom;
+        if ((!ok1 || !ok2) && window.QRCode == null) {
+          setTimeout(setupQr, 300);
+        }
+      }
+
+      window.addEventListener("load", setupQr);
+
+      buildPoseControls();
+
+      // ---------- AR pose packet parsing (40 bytes) ----------
+      // Layout:
+      // u32 seq (LE) @0
+      // f64 t (LE)  @4
+      // f32 px,py,pz (LE) @12
+      // f32 qx,qy,qz,qw (LE) @24
+
+      let lastRxHz = 0;
+      const basePos = { x: 0, y: 0, z: 0 };
+      const posScale = 1.0;
+
+      const modelCorrection = new THREE.Quaternion().setFromEuler(
+        new THREE.Euler(0, -Math.PI / 2, 0),
+      );
+      const useCameraHand = true;
+      let zeroPos = { x: 0, y: 0, z: 0 };
+      let lastSample = null;
+
+      let rxCount = 0;
+      let rxWindowStart = performance.now();
+
+      function parse40(buf) {
+        const dv = new DataView(buf);
+        const seq = dv.getUint32(0, true);
+        const t = dv.getFloat64(4, true);
+
+        const px = dv.getFloat32(12, true);
+        const py = dv.getFloat32(16, true);
+        const pz = dv.getFloat32(20, true);
+
+        const qx = dv.getFloat32(24, true);
+        const qy = dv.getFloat32(28, true);
+        const qz = dv.getFloat32(32, true);
+        const qw = dv.getFloat32(36, true);
+
+        return { seq, t, px, py, pz, qx, qy, qz, qw };
+      }
+
+      function parse28(buf) {
+        const dv = new DataView(buf);
+        const seq = dv.getUint32(0, true);
+        const alpha = dv.getFloat32(4, true);
+        const beta = dv.getFloat32(8, true);
+        const gamma = dv.getFloat32(12, true);
+        const ax = dv.getFloat32(16, true);
+        const ay = dv.getFloat32(20, true);
+        const az = dv.getFloat32(24, true);
+        return { seq, alpha, beta, gamma, ax, ay, az };
+      }
+
+      function updateStats() {
+        const sensor = sensorLink.getState();
+        const bcast = broadcastLink.getState();
+        statsEl.textContent = `pc: ${sensor.pcState} / ice: ${sensor.iceState}
+          dc: ${sensor.dcState}
+          ws: ${sensor.wsState}
+          broadcast: ${bcast.wsState} / viewers: ${bcast.viewers}
+          bcast: ${bcast.lastEvent}
+          rxHz: ${lastRxHz.toFixed(1)}
+          seq: ${sensorState1.lastSeq}
+          t: ${sensorState1.lastT.toFixed(3)}
+          pos(xyz):  ${sensorState1.lastPos.map((v) => v.toFixed(3)).join(", ")}
+          quat(xyzw): ${sensorState1.lastQuat
+            .map((v) => v.toFixed(3))
+            .join(", ")}`;
+      }
+      // status UI disabled; use console logs on state changes
+
+      function createSensorLink(opts) {
+        const roomId = opts.roomId;
+        const onPacket = opts.onPacket;
+        const statusEl = opts.statusEl || null;
+        const logTag = opts.logTag || "sensor";
+        const state = {
+          wsState: "disconnected",
+          pcState: "none",
+          iceState: "none",
+          dcState: "none",
+        };
+
+        let pc = null;
+        let dc = null;
+        let ws = null;
+        let lastOfferSdp = "";
+        let localIceLines = [];
+        let joinRole = null;
+        let shouldOffer = false;
+        let sendTimer = null;
+        let offerSent = false;
+
+        function updateState() {
+          state.pcState = pc ? pc.connectionState || "unknown" : "none";
+          state.iceState = pc ? pc.iceConnectionState || "unknown" : "none";
+          state.dcState = dc ? dc.readyState || "unknown" : "none";
+          if (opts.onStateChange) {
+            opts.onStateChange({ ...state }, pc);
+          }
+        }
+
+        function logState(tag) {
+          console.log(
+            "[" + logTag + "]",
+            tag,
+            state.wsState,
+            state.pcState,
+            state.iceState,
+            state.dcState,
+          );
+        }
+        function setSensorStatus(isConnected) {
+          if (!statusEl) return;
+          statusEl.textContent = isConnected ? "Connected" : "Not connected";
+        }
+        function startSendLoop() {
+          if (!opts.sendPayload || sendTimer) return;
+          const interval = opts.sendIntervalMs || 33;
+          console.log("[" + logTag + "] send loop start", interval + "ms");
+          sendTimer = setInterval(() => {
+            if (!dc || dc.readyState !== "open") return;
+            try {
+              const payload = opts.sendPayload();
+              if (!payload) return;
+              if (payload instanceof ArrayBuffer) {
+                console.log("[" + logTag + "] sending ArrayBuffer");
+                dc.send(payload);
+                if (opts.onSend) opts.onSend(payload);
+              } else {
+                console.log("[" + logTag + "] sending text");
+                dc.send(JSON.stringify(payload));
+                if (opts.onSend) opts.onSend(payload);
+              }
+            } catch (e) {
+              console.log(
+                "[" + logTag + "] send error",
+                e && e.message ? e.message : e,
+              );
+            }
+          }, interval);
+        }
+        function stopSendLoop() {
+          if (sendTimer) {
+            clearInterval(sendTimer);
+            sendTimer = null;
+            console.log("[" + logTag + "] send loop stop");
+          }
+        }
+
+        function sendSignal(payload) {
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          ws.send(
+            JSON.stringify({ sender: clientId, room: roomId(), ...payload }),
+          );
+        }
+
+        function connectSignaling() {
+          if (
+            ws &&
+            (ws.readyState === WebSocket.OPEN ||
+              ws.readyState === WebSocket.CONNECTING)
+          ) {
+            return;
+          }
+          ws = new WebSocket(signalingUrl);
+          state.wsState = "connecting";
+          updateState();
+
+          ws.onopen = () => {
+            state.wsState = "open";
+            updateState();
+            logState("ws open");
+            setSensorStatus(false);
+            sendSignal({ type: "join" });
+          };
+
+          ws.onclose = () => {
+            state.wsState = "closed";
+            updateState();
+            logState("ws close");
+            setSensorStatus(false);
+          };
+
+          ws.onerror = () => {
+            state.wsState = "error";
+            updateState();
+            logState("ws error");
+            setSensorStatus(false);
+          };
+
+          ws.onmessage = async (evt) => {
+            let msg = null;
+            try {
+              msg = JSON.parse(evt.data);
+            } catch {
+              return;
+            }
+            if (msg.type === "joined") {
+              joinRole = msg.role || null;
+              shouldOffer = joinRole === "offerer";
+              console.log("[" + logTag + "] joined", joinRole || "?");
+              if (shouldOffer) {
+                ensureDataChannel();
+                if (offerSent) return;
+                if (lastOfferSdp) {
+                  sendSignal({ type: "offer", sdp: lastOfferSdp });
+                  offerSent = true;
+                } else {
+                  createOffer();
+                }
+              }
+              return;
+            }
+            if (msg && msg.sender && msg.sender === clientId) return;
+            if (!pc) return;
+            if (msg.type === "offer" && msg.sdp) {
+              console.log("[" + logTag + "] offer recv");
+              await setRemoteOfferSdp(msg.sdp);
+              return;
+            }
+            if (msg.type === "answer" && msg.sdp) {
+              console.log("[" + logTag + "] answer recv");
+              await setRemoteAnswerSdp(msg.sdp);
+              return;
+            }
+            if (msg.type === "ready") {
+              if (!shouldOffer) return;
+              if (lastOfferSdp) {
+                sendSignal({ type: "offer", sdp: lastOfferSdp });
+                console.log("[" + logTag + "] offer resend on ready");
+                offerSent = true;
+              } else if (pc) {
+                createOffer();
+              }
+              return;
+            }
+            if (msg.type === "ice" && msg.candidate) {
+              try {
+                await pc.addIceCandidate(msg.candidate);
+                updateState();
+              } catch {}
+              console.log("[" + logTag + "] ice recv");
+              return;
+            }
+          };
+        }
+
+        async function createOffer() {
+          if (!pc) return;
+          connectSignaling();
+          ensureDataChannel();
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          lastOfferSdp = pc.localDescription.sdp;
+          console.log("[sensor offer]", {
+            len: lastOfferSdp.length,
+            hasLf: lastOfferSdp.indexOf("\n") !== -1,
+            hasCr: lastOfferSdp.indexOf("\r") !== -1,
+            head: lastOfferSdp.split(/\r\n|\n/).slice(0, 6),
+          });
+          if (offerOut) offerOut.value = lastOfferSdp;
+          sendSignal({ type: "offer", sdp: lastOfferSdp });
+          console.log("[" + logTag + "] offer sent");
+          offerSent = true;
+          updateState();
+        }
+
+        function ensureDataChannel() {
+          if (!pc || dc) return;
+          dc = pc.createDataChannel("imu", {
+            ordered: true,
+            maxRetransmits: 0,
+          });
+          attachDataChannel(dc);
+        }
+
+        function attachDataChannel(channel) {
+          dc = channel;
+          dc.binaryType = "arraybuffer";
+          dc.onopen = () => {
+            updateState();
+            setSensorStatus(true);
+            console.log("[" + logTag + "] dc open");
+            startSendLoop();
+          };
+          dc.onclose = () => {
+            updateState();
+            setSensorStatus(false);
+            console.log("[" + logTag + "] dc close");
+            stopSendLoop();
+          };
+          dc.onmessage = async (e) => {
+            let buf = null;
+            if (e.data instanceof ArrayBuffer) {
+              buf = e.data;
+            } else if (e.data && typeof e.data.arrayBuffer === "function") {
+              buf = await e.data.arrayBuffer();
+            } else if (e.data && e.data.buffer instanceof ArrayBuffer) {
+              buf = e.data.buffer;
+            } else if (typeof e.data === "string") {
+              if (logTag === "enemy") {
+                console.log("[enemy] raw text", e.data);
+              }
+              return;
+            }
+            if (!buf) return;
+            if (logTag === "enemy") {
+              console.log("[enemy] raw packet", buf);
+              const decoded = decodeEnemy124(buf);
+              if (decoded) {
+                lastEnemyDecoded = decoded;
+                const fmt3 = (v) => v.map((n) => n.toFixed(3)).join(",");
+                console.log(
+                  "[enemy] raw124 seq=" +
+                    decoded.seq +
+                    " stale=" +
+                    (decoded.isStale ? 1 : 0) +
+                    " headPos=" +
+                    fmt3(decoded.headPos) +
+                    " headFwd=" +
+                    fmt3(decoded.headFwd) +
+                    " lPalmPos=" +
+                    fmt3(decoded.leftPalmPos) +
+                    " lPalmFwd=" +
+                    fmt3(decoded.leftPalmFwd) +
+                    " lElbowPos=" +
+                    fmt3(decoded.leftElbowPos) +
+                    " rPalmPos=" +
+                    fmt3(decoded.rightPalmPos) +
+                    " rPalmFwd=" +
+                    fmt3(decoded.rightPalmFwd) +
+                    " rElbowPos=" +
+                    fmt3(decoded.rightElbowPos) +
+                    " swordPos=" +
+                    fmt3(decoded.swordPos) +
+                    " swordFwd=" +
+                    fmt3(decoded.swordFwd),
+                );
+                if (decoded.isStale) return;
+                applyBodyHeadFromFwd(decoded.bodyYaw, decoded.headPitch);
+                lastEnemyPoseRadRaw = { ...decoded };
+
+                const basePos = getEnemyBasePosition();
+                const mapped = {
+                  x: decoded.headPos[0],
+                  y: 0.95,
+                  z: -decoded.headPos[2],
+                };
+                const posAdj = refEnemyPos
+                  ? {
+                      x: mapped.x - refEnemyPos.x,
+                      y: mapped.y - refEnemyPos.y,
+                      z: mapped.z - refEnemyPos.z,
+                    }
+                  : mapped;
+                skeletonRoot.position
+                  .set(posAdj.x, posAdj.y, posAdj.z)
+                  .add(basePos)
+                  .add(modelOffset);
+
+                const mapWorld = (v) => {
+                  const refX = refEnemyPos ? refEnemyPos.x : 0;
+                  const refZ = refEnemyPos ? refEnemyPos.z : 0;
+                  return new THREE.Vector3(
+                    v[0] - refX + basePos.x + modelOffset.x,
+                    v[1] + basePos.y + modelOffset.y,
+                    -v[2] - refZ + basePos.z + modelOffset.z,
+                  );
+                };
+                const shoulderPos = (side) => [
+                  decoded.headPos[0] + (side === "left" ? -0.15 : 0.15),
+                  decoded.headPos[1] - 0.25,
+                  decoded.headPos[2] - 0.05,
+                ];
+                const leftShoulderWorld = mapWorld(shoulderPos("left"));
+                const rightShoulderWorld = mapWorld(shoulderPos("right"));
+                const leftWristWorld = mapWorld(decoded.leftPalmPos);
+                const rightWristWorld = mapWorld(decoded.rightPalmPos);
+                const leftPalmFwdWorld = mapWorld([
+                  decoded.leftPalmPos[0] + decoded.leftPalmFwd[0] * 0.2,
+                  decoded.leftPalmPos[1] + decoded.leftPalmFwd[1] * 0.2,
+                  decoded.leftPalmPos[2] + decoded.leftPalmFwd[2] * 0.2,
+                ]);
+                const rightPalmFwdWorld = mapWorld([
+                  decoded.rightPalmPos[0] + decoded.rightPalmFwd[0] * 0.2,
+                  decoded.rightPalmPos[1] + decoded.rightPalmFwd[1] * 0.2,
+                  decoded.rightPalmPos[2] + decoded.rightPalmFwd[2] * 0.2,
+                ]);
+
+                applyArmNoElbow(
+                  leftArmGroup,
+                  leftElbowGroup,
+                  leftShoulderWorld,
+                  leftWristWorld,
+                  leftPalmFwdWorld,
+                );
+                applyArmNoElbow(
+                  rightArmGroup,
+                  rightElbowGroup,
+                  rightShoulderWorld,
+                  rightWristWorld,
+                  rightPalmFwdWorld,
+                );
+
+                if (riggedBones.head) {
+                  setBoneWorldPosition(
+                    riggedBones.head,
+                    mapWorld(decoded.headPos),
+                  );
+                }
+                if (riggedBones.leftUpperArm) {
+                  setBoneWorldPosition(
+                    riggedBones.leftUpperArm,
+                    leftShoulderWorld,
+                  );
+                }
+                if (riggedBones.leftLowerArm) {
+                  setBoneWorldPosition(
+                    riggedBones.leftLowerArm,
+                    leftWristWorld,
+                  );
+                }
+                if (riggedBones.rightUpperArm) {
+                  setBoneWorldPosition(
+                    riggedBones.rightUpperArm,
+                    rightShoulderWorld,
+                  );
+                }
+                if (riggedBones.rightLowerArm) {
+                  setBoneWorldPosition(
+                    riggedBones.rightLowerArm,
+                    rightWristWorld,
+                  );
+                }
+
+                const setPoint = (name, v, color) => {
+                  const p = ensurePoint(name, color);
+                  const refX = refEnemyPos ? refEnemyPos.x : 0;
+                  const refZ = refEnemyPos ? refEnemyPos.z : 0;
+                  p.position.set(
+                    v[0] - refX + basePos.x + modelOffset.x,
+                    v[1] + basePos.y + modelOffset.y,
+                    -v[2] - refZ + basePos.z + modelOffset.z,
+                  );
+                };
+                setPoint("headPos", decoded.headPos, 0xffffff);
+                setPoint("lPalmPos", decoded.leftPalmPos, 0x66ccff);
+                setPoint("lElbowPos", decoded.leftElbowPos, 0x66ff99);
+                setPoint("rPalmPos", decoded.rightPalmPos, 0xff9966);
+                setPoint("rElbowPos", decoded.rightElbowPos, 0xffcc66);
+
+                if (saberRigged && decoded.swordPos && decoded.swordFwd) {
+                  const refX = refEnemyPos ? refEnemyPos.x : 0;
+                  const refZ = refEnemyPos ? refEnemyPos.z : 0;
+                  const sx =
+                    decoded.swordPos[0] - refX + basePos.x + modelOffset.x;
+                  const sy = decoded.swordPos[1] + basePos.y + modelOffset.y;
+                  const sz =
+                    -decoded.swordPos[2] - refZ + basePos.z + modelOffset.z;
+                  saberRigged.position.set(sx, sy, sz);
+                  const dir = new THREE.Vector3(
+                    decoded.swordFwd[0],
+                    decoded.swordFwd[1],
+                    decoded.swordFwd[2],
+                  ).normalize();
+                  const target = new THREE.Vector3(
+                    sx + dir.x,
+                    sy + dir.y,
+                    sz - dir.z,
+                  );
+                  saberRigged.lookAt(target);
+                }
+              }
+              // } else if (logTag === "sensor1") {
+              //   console.log("[sensor] raw packet", buf);
+            }
+            onPacket(buf);
+          };
+        }
+
+        async function setRemoteOfferSdp(rawSdp) {
+          if (!pc || !rawSdp) return;
+          console.log("[" + logTag + "] raw offer sdp", rawSdp);
+          let sdp = String(rawSdp || "").trim();
+          if (!sdp) return;
+          if (sdp.indexOf("\\n") !== -1 || sdp.indexOf("\\r") !== -1) {
+            sdp = sdp
+              .replace(/\\r\\n/g, "\n")
+              .replace(/\\n/g, "\n")
+              .replace(/\\r/g, "\n");
+          }
+          sdp = sdp.replace(/\u2028|\u2029/g, "\n");
+          sdp = sdp.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+          sdp = sdp.replace(/([^\n])([a-z]=)/g, "$1\n$2");
+          sdp = sdp.replace(/[ \t\u00a0]+([a-z])=/g, "\n$1=");
+          sdp = sdp.replace(/\n+/g, "\n").replace(/\n/g, "\r\n");
+          sdp = sdp
+            .replace(/^a=max-message-size:.*(?:\r\n|\r|\n)?/gm, "")
+            .replace(/^a=extmap-allow-mixed.*(?:\r\n|\r|\n)?/gm, "")
+            .replace(/^a=extmap:.*(?:\r\n|\r|\n)?/gm, "")
+            .replace(/^a=rtcp-rsize.*(?:\r\n|\r|\n)?/gm, "")
+            .replace(/^a=setup:actpass\r\n?$/gm, "a=setup:active\r\n")
+            .replace(/^a=candidate:.*(?:\r\n|\r|\n)?/gm, "");
+          sdp = sdp
+            .split(/\r\n/)
+            .filter((line) => !line || /^[a-z]=/.test(line))
+            .map((line) => {
+              if (line.indexOf("a=ice-pwd:") === 0) {
+                return line.replace(/\s+$/, "").replace(/\/$/, "");
+              }
+              return line;
+            })
+            .join("\r\n");
+          if (!sdp.endsWith("\r\n")) sdp += "\r\n";
+          await pc.setRemoteDescription({ type: "offer", sdp });
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          sendSignal({ type: "answer", sdp: pc.localDescription.sdp });
+          updateState();
+        }
+
+        async function setRemoteAnswerSdp(rawSdp) {
+          if (!pc || !rawSdp) return;
+          console.log("[" + logTag + "] raw answer sdp", rawSdp);
+          let sdp = String(rawSdp || "").trim();
+          if (!sdp) return;
+          if (sdp.indexOf("\\n") !== -1 || sdp.indexOf("\\r") !== -1) {
+            sdp = sdp
+              .replace(/\\r\\n/g, "\n")
+              .replace(/\\n/g, "\n")
+              .replace(/\\r/g, "\n");
+          }
+          sdp = sdp.replace(/\u2028|\u2029/g, "\n");
+          sdp = sdp.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+          sdp = sdp.replace(/([^\n])([a-z]=)/g, "$1\n$2");
+          sdp = sdp.replace(/[ \t\u00a0]+([a-z])=/g, "\n$1=");
+          sdp = sdp.replace(/\n+/g, "\n").replace(/\n/g, "\r\n");
+          sdp = sdp
+            .replace(/^a=max-message-size:.*(?:\r\n|\r|\n)?/gm, "")
+            .replace(/^a=extmap-allow-mixed.*(?:\r\n|\r|\n)?/gm, "")
+            .replace(/^a=extmap:.*(?:\r\n|\r|\n)?/gm, "")
+            .replace(/^a=rtcp-rsize.*(?:\r\n|\r|\n)?/gm, "")
+            .replace(/^a=setup:actpass\r\n?$/gm, "a=setup:active\r\n")
+            .replace(/^a=candidate:.*(?:\r\n|\r|\n)?/gm, "");
+          sdp = sdp
+            .split(/\r\n/)
+            .filter((line) => !line || /^[a-z]=/.test(line))
+            .map((line) => {
+              if (line.indexOf("a=ice-pwd:") === 0) {
+                return line.replace(/\s+$/, "").replace(/\/$/, "");
+              }
+              return line;
+            })
+            .join("\r\n");
+          if (!sdp.endsWith("\r\n")) sdp += "\r\n";
+          await pc.setRemoteDescription({ type: "answer", sdp });
+          console.log("[" + logTag + "] answer set");
+          updateState();
+        }
+
+        function start() {
+          localIceLines = [];
+          joinRole = null;
+          shouldOffer = false;
+          offerSent = false;
+
+          pc = new RTCPeerConnection({
+            sdpSemantics: "plan-b",
+            iceServers: [
+              { urls: "stun:3.37.140.87:3478" },
+              {
+                urls: [
+                  "turn:3.37.140.87:3478?transport=udp",
+                  "turn:3.37.140.87:3478?transport=tcp",
+                ],
+                username: "imuuser",
+                credential: "imupass",
+              },
+            ],
+          });
+
+          pc.onicecandidate = (e) => {
+            if (!e.candidate) return;
+            const obj = {
+              candidate: e.candidate.candidate,
+              sdpMLineIndex: e.candidate.sdpMLineIndex,
+              sdpMid: e.candidate.sdpMid,
+            };
+            localIceLines.push(JSON.stringify(obj));
+            if (iceOut) iceOut.value = localIceLines.join("\n");
+            sendSignal({ type: "ice", candidate: obj });
+          };
+
+          pc.oniceconnectionstatechange = () => {
+            updateState();
+            const ok =
+              pc.iceConnectionState === "connected" ||
+              pc.iceConnectionState === "completed";
+            setSensorStatus(ok);
+          };
+          pc.onconnectionstatechange = () => {
+            updateState();
+            const ok = pc.connectionState === "connected";
+            setSensorStatus(ok);
+          };
+
+          pc.ondatachannel = (e) => {
+            attachDataChannel(e.channel);
+          };
+
+          connectSignaling();
+          updateState();
+        }
+
+        function stop() {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.close(1000, "page unload");
+          }
+          if (dc) {
+            try {
+              dc.close();
+            } catch {}
+          }
+          if (pc) {
+            try {
+              pc.close();
+            } catch {}
+          }
+          ws = null;
+          dc = null;
+          pc = null;
+          state.wsState = "disconnected";
+          joinRole = null;
+          shouldOffer = false;
+          offerSent = false;
+          updateState();
+          logState("stopped");
+          setSensorStatus(false);
+          stopSendLoop();
+        }
+
+        function getState() {
+          updateState();
+          return { ...state };
+        }
+
+        return { start, stop, getState };
+      }
+
+      function createBroadcastLink(opts) {
+        const roomId = opts.roomId;
+        const getStream = opts.getStream;
+        const state = {
+          wsState: "disconnected",
+          viewers: 0,
+          lastEvent: "",
+        };
+
+        let broadcastWs = null;
+        const broadcastPeers = new Map();
+        let joinRole = null;
+        let shouldOffer = false;
+
+        function updateState() {
+          state.viewers = broadcastPeers.size;
+        }
+
+        function logState(tag) {
+          console.log("[bcast]", tag, state.wsState, "viewers", state.viewers);
+        }
+
+        function sendSignal(payload) {
+          if (!broadcastWs || broadcastWs.readyState !== WebSocket.OPEN) return;
+          broadcastWs.send(
+            JSON.stringify({
+              sender: clientId + "-b",
+              room: roomId(),
+              ...payload,
+            }),
+          );
+        }
+
+        async function makeOffer(viewerId, pcView, includeTo) {
+          const offer = await pcView.createOffer();
+          await pcView.setLocalDescription(offer);
+          const payload = { type: "offer", sdp: pcView.localDescription.sdp };
+          console.log("[bcast offer]", {
+            to: viewerId || "anon",
+            len: payload.sdp.length,
+            hasLf: payload.sdp.indexOf("\n") !== -1,
+            hasCr: payload.sdp.indexOf("\r") !== -1,
+            head: payload.sdp.split(/\r\n|\n/).slice(0, 6),
+          });
+          if (includeTo && viewerId) {
+            payload.to = viewerId;
+          }
+          sendSignal(payload);
+          state.lastEvent = viewerId
+            ? `offer to ${viewerId.slice(0, 6)}`
+            : "offer to anon";
+          updateState();
+        }
+
+        function attachSensorChannel(sensorDc, viewerId) {
+          sensorDc.binaryType = "arraybuffer";
+          sensorDc.onopen = () => {
+            console.log("[sensor dc] open", viewerId);
+          };
+          sensorDc.onclose = () => {
+            console.log("[sensor dc] closed", viewerId);
+          };
+          sensorDc.onerror = (e) => {
+            console.log("[sensor dc] error", viewerId, e);
+          };
+          sensorDc.onmessage = async (e) => {
+            let buf = e.data;
+            if (!(buf instanceof ArrayBuffer)) {
+              buf = await e.data.arrayBuffer();
+            }
+            if (buf.byteLength !== 28) {
+              console.log("[sensor]", viewerId, "len", buf.byteLength);
+              return;
+            }
+            const p = parse28(buf);
+            sensorOri = { alpha: p.alpha, beta: p.beta, gamma: p.gamma };
+            sensorAcc = { x: p.ax, y: p.ay, z: p.az };
+            sensorHasOri = true;
+            lastOriUpdate = performance.now();
+            console.log(
+              "[ori]",
+              p.alpha.toFixed(2),
+              p.beta.toFixed(2),
+              p.gamma.toFixed(2),
+            );
+            console.log(
+              "[sensor]",
+              viewerId,
+              "seq",
+              p.seq,
+              "ori",
+              p.alpha.toFixed(2),
+              p.beta.toFixed(2),
+              p.gamma.toFixed(2),
+              "acc",
+              p.ax.toFixed(2),
+              p.ay.toFixed(2),
+              p.az.toFixed(2),
+            );
+          };
+        }
+
+        function ensurePeer(viewerId) {
+          if (broadcastPeers.has(viewerId)) return broadcastPeers.get(viewerId);
+          const stream = getStream();
+          if (!stream) {
+            alert("captureStream is not supported in this browser.");
+            return null;
+          }
+          const pcView = new RTCPeerConnection({
+            sdpSemantics: "plan-b",
+            iceServers: [
+              { urls: "stun:3.37.140.87:3478" },
+              {
+                urls: [
+                  "turn:3.37.140.87:3478?transport=udp",
+                  "turn:3.37.140.87:3478?transport=tcp",
+                ],
+                username: "imuuser",
+                credential: "imupass",
+              },
+            ],
+          });
+          broadcastPeers.set(viewerId, pcView);
+
+          if (pcView.addStream) {
+            pcView.addStream(stream);
+          } else {
+            const track = stream.getVideoTracks()[0];
+            if (track) pcView.addTrack(track, stream);
+          }
+
+          if (shouldOffer) {
+            const sensorDc = pcView.createDataChannel("sensor", {
+              ordered: false,
+              maxRetransmits: 0,
+            });
+            attachSensorChannel(sensorDc, viewerId);
+          }
+
+          pcView.ondatachannel = (e) => {
+            const ch = e.channel;
+            ch.binaryType = "arraybuffer";
+            console.log("[datachannel] recv", viewerId, ch.label);
+            ch.onopen = () =>
+              console.log("[datachannel] open", viewerId, ch.label);
+            ch.onclose = () =>
+              console.log("[datachannel] close", viewerId, ch.label);
+            ch.onmessage = (ev) => {
+              console.log(
+                "[datachannel] msg",
+                viewerId,
+                ch.label,
+                ev.data && ev.data.byteLength ? ev.data.byteLength : ev.data,
+              );
+            };
+            if (ch.label === "sensor") {
+              attachSensorChannel(ch, viewerId);
+            }
+          };
+
+          pcView.onicecandidate = (e) => {
+            if (!e.candidate) return;
+            const obj = {
+              candidate: e.candidate.candidate,
+              sdpMLineIndex: e.candidate.sdpMLineIndex,
+              sdpMid: e.candidate.sdpMid,
+            };
+            sendSignal({ type: "ice", candidate: obj, to: viewerId });
+          };
+
+          pcView.onconnectionstatechange = () => {
+            if (
+              pcView.connectionState === "failed" ||
+              pcView.connectionState === "closed"
+            ) {
+              broadcastPeers.delete(viewerId);
+            }
+            updateState();
+            if (qrStatusView) {
+              qrStatusView.textContent =
+                pcView.connectionState === "connected"
+                  ? "Connected"
+                  : "Not connected";
+            }
+          };
+
+          return pcView;
+        }
+
+        function getAnyPeer() {
+          for (const [, pcView] of broadcastPeers) return pcView;
+          return null;
+        }
+
+        function connectSignaling() {
+          if (
+            broadcastWs &&
+            (broadcastWs.readyState === WebSocket.OPEN ||
+              broadcastWs.readyState === WebSocket.CONNECTING)
+          ) {
+            return;
+          }
+          broadcastWs = new WebSocket(signalingUrl);
+          state.wsState = "connecting";
+          updateState();
+
+          broadcastWs.onopen = () => {
+            state.wsState = "open";
+            updateState();
+            logState("ws open");
+            if (qrStatusView) qrStatusView.textContent = "Not connected";
+            sendSignal({ type: "join" });
+          };
+
+          broadcastWs.onclose = () => {
+            state.wsState = "closed";
+            updateState();
+            logState("ws close");
+            if (qrStatusView) qrStatusView.textContent = "Not connected";
+          };
+
+          broadcastWs.onerror = () => {
+            state.wsState = "error";
+            updateState();
+            logState("ws error");
+            if (qrStatusView) qrStatusView.textContent = "Not connected";
+          };
+
+          broadcastWs.onmessage = async (evt) => {
+            let msg = null;
+            try {
+              msg = JSON.parse(evt.data);
+            } catch {
+              return;
+            }
+            const senderId = msg.sender || msg.viewerId || "";
+            if (msg.type === "joined") {
+              joinRole = msg.role || null;
+              shouldOffer = joinRole === "offerer";
+              state.lastEvent = `joined ${joinRole || "?"}`;
+              updateState();
+              console.log("[bcast] joined", joinRole || "?");
+              if (!shouldOffer) {
+                sendSignal({ type: "ready" });
+              }
+              return;
+            }
+            if (!msg || msg.sender === clientId + "-b") return;
+            if (msg.room && msg.room !== roomId()) return;
+            if (
+              msg.type === "ready" ||
+              msg.type === "joined" ||
+              msg.type === "join"
+            ) {
+              if (!shouldOffer) return;
+              if (!senderId) {
+                state.lastEvent = "ready from ?";
+                const anonId = "__anon__";
+                const pcView = ensurePeer(anonId);
+                if (pcView) {
+                  await makeOffer(null, pcView, false);
+                }
+                updateState();
+                return;
+              }
+              state.lastEvent = `ready from ${senderId.slice(0, 6)}`;
+              const pcView = ensurePeer(senderId);
+              if (pcView) {
+                await makeOffer(senderId, pcView, true);
+              }
+              updateState();
+              return;
+            }
+            if (msg.type === "offer" && msg.sdp) {
+              const pcView = ensurePeer(senderId || "__anon__");
+              if (!pcView) return;
+              console.log("[bcast] offer recv");
+              await setRemoteOfferSdp(pcView, msg.sdp, senderId);
+              return;
+            }
+            if (
+              msg.type === "answer" &&
+              msg.sdp &&
+              (!msg.to || msg.to === clientId + "-b")
+            ) {
+              const pc = broadcastPeers.get(senderId) || getAnyPeer();
+              if (!pc) return;
+              await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+              state.lastEvent = senderId
+                ? `answer from ${senderId.slice(0, 6)}`
+                : "answer from ?";
+              updateState();
+              console.log("[bcast] answer recv");
+              if (qrStatusView) qrStatusView.textContent = "Connected";
+              return;
+            }
+            if (
+              msg.type === "ice" &&
+              msg.candidate &&
+              (!msg.to || msg.to === clientId + "-b")
+            ) {
+              const pc = broadcastPeers.get(senderId) || getAnyPeer();
+              if (!pc) return;
+              try {
+                await pc.addIceCandidate(msg.candidate);
+              } catch {}
+              state.lastEvent = senderId
+                ? `ice from ${senderId.slice(0, 6)}`
+                : "ice from ?";
+              updateState();
+              console.log("[bcast] ice recv");
+              return;
+            }
+          };
+        }
+
+        async function setRemoteOfferSdp(pcView, rawSdp, senderId) {
+          let sdp = String(rawSdp || "").trim();
+          if (!sdp) return;
+          if (sdp.indexOf("\\n") !== -1 || sdp.indexOf("\\r") !== -1) {
+            sdp = sdp
+              .replace(/\\r\\n/g, "\n")
+              .replace(/\\n/g, "\n")
+              .replace(/\\r/g, "\n");
+          }
+          sdp = sdp.replace(/\u2028|\u2029/g, "\n");
+          sdp = sdp.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+          // split if multiple x= on one line
+          sdp = sdp.replace(/[ \t\u00a0]+([vosctamb])=/g, "\n$1=");
+          sdp = sdp.replace(/\n+/g, "\n").replace(/\n/g, "\r\n");
+          sdp = sdp
+            .replace(/^a=max-message-size:.*(?:\r\n|\r|\n)?/gm, "")
+            .replace(/^a=extmap-allow-mixed.*(?:\r\n|\r|\n)?/gm, "")
+            .replace(/^a=extmap:.*(?:\r\n|\r|\n)?/gm, "")
+            .replace(/^a=rtcp-rsize.*(?:\r\n|\r|\n)?/gm, "")
+            .replace(/^a=setup:actpass\r\n?$/gm, "a=setup:active\r\n");
+          await pcView.setRemoteDescription({ type: "offer", sdp });
+          const answer = await pcView.createAnswer();
+          await pcView.setLocalDescription(answer);
+          sendSignal({
+            type: "answer",
+            sdp: pcView.localDescription.sdp,
+            to: senderId || undefined,
+          });
+          state.lastEvent = senderId
+            ? `answer to ${senderId.slice(0, 6)}`
+            : "answer to ?";
+          updateState();
+          console.log("[bcast] answer sent");
+          if (qrStatusView) qrStatusView.textContent = "Connected";
+        }
+
+        function start() {
+          connectSignaling();
+        }
+
+        function stop() {
+          for (const [, pcView] of broadcastPeers) {
+            try {
+              pcView.close();
+            } catch {}
+          }
+          broadcastPeers.clear();
+          if (broadcastWs && broadcastWs.readyState === WebSocket.OPEN) {
+            broadcastWs.close(1000, "broadcast stop");
+          }
+          broadcastWs = null;
+          state.wsState = "disconnected";
+          joinRole = null;
+          shouldOffer = false;
+          updateState();
+          if (qrStatusView) qrStatusView.textContent = "Not connected";
+        }
+
+        function getState() {
+          updateState();
+          return { ...state };
+        }
+
+        return { start, stop, getState };
+      }
+
+      function applyPosePacket(buf, target) {
+        if (!(buf instanceof ArrayBuffer) || buf.byteLength !== 40) return;
+        const p = parse40(buf);
+
+        if (target) {
+          target.lastSeq = p.seq;
+          target.lastT = p.t;
+          target.lastPos = [p.px, p.py, p.pz];
+          target.lastQuat = [p.qx, p.qy, p.qz, p.qw];
+        }
+        if (target === sensorState1) {
+          console.log(
+            "[sensor] px py pz",
+            p.px.toFixed(3),
+            p.py.toFixed(3),
+            p.pz.toFixed(3),
+            "qx qy qz qw",
+            p.qx.toFixed(3),
+            p.qy.toFixed(3),
+            p.qz.toFixed(3),
+            p.qw.toFixed(3),
+          );
+        }
+
+        rxCount++;
+        const now = performance.now();
+        const dt = now - rxWindowStart;
+        if (dt >= 500) {
+          lastRxHz = (rxCount * 1000) / dt;
+          rxCount = 0;
+          rxWindowStart = now;
+        }
+
+        const px = p.px;
+        const py = p.py;
+        const pz = p.pz;
+        const qx = p.qx;
+        const qy = p.qy;
+        const qz = p.qz;
+        const qw = p.qw;
+        lastSample = { px, py, pz, qx, qy, qz, qw };
+
+        if (target && target.poseObject) {
+          target.poseObject.position.set(
+            basePos.x + (px - zeroPos.x) * posScale,
+            basePos.y + (py - zeroPos.y) * posScale,
+            basePos.z + (pz - zeroPos.z) * posScale,
+          );
+          const deviceQuat = new THREE.Quaternion(qx, qy, qz, qw);
+          target.poseObject.quaternion
+            .copy(deviceQuat)
+            .multiply(modelCorrection);
+        }
+      }
+
+      function decodeEnemy72(buf) {
+        if (!(buf instanceof ArrayBuffer) || buf.byteLength !== 72) return null;
+        const dv = new DataView(buf);
+        let off = 0;
+        const seq = dv.getUint32(off, true);
+        off += 4;
+        const px = dv.getFloat32(off, true);
+        off += 4;
+        const py = dv.getFloat32(off, true);
+        off += 4;
+        const pz = dv.getFloat32(off, true);
+        off += 4;
+        const qx = dv.getFloat32(off, true);
+        off += 4;
+        const qy = dv.getFloat32(off, true);
+        off += 4;
+        const qz = dv.getFloat32(off, true);
+        off += 4;
+        const qw = dv.getFloat32(off, true);
+        off += 4;
+        const bodyYaw = dv.getFloat32(off, true);
+        off += 4;
+        const headPitch = dv.getFloat32(off, true);
+        off += 4;
+        const leftArmPitch = dv.getFloat32(off, true);
+        off += 4;
+        const leftArmYaw = dv.getFloat32(off, true);
+        off += 4;
+        const leftArmAbd = dv.getFloat32(off, true);
+        off += 4;
+        const leftElbowPitch = dv.getFloat32(off, true);
+        off += 4;
+        const rightArmPitch = dv.getFloat32(off, true);
+        off += 4;
+        const rightArmYaw = dv.getFloat32(off, true);
+        off += 4;
+        const rightArmAbd = dv.getFloat32(off, true);
+        off += 4;
+        const rightElbowPitch = dv.getFloat32(off, true);
+        return {
+          seq,
+          px,
+          py,
+          pz,
+          qx,
+          qy,
+          qz,
+          qw,
+          bodyYaw,
+          headPitch,
+          leftArmPitch,
+          leftArmYaw,
+          leftArmAbd,
+          leftElbowPitch,
+          rightArmPitch,
+          rightArmYaw,
+          rightArmAbd,
+          rightElbowPitch,
+        };
+      }
+
+      function decodeEnemy124(buf) {
+        if (!(buf instanceof ArrayBuffer) || buf.byteLength !== 124)
+          return null;
+        const dv = new DataView(buf);
+        const header = dv.getUint32(0, true);
+        const isStale = (header & 0x80000000) !== 0;
+        const seq = header & 0x7fffffff;
+        const floats = [];
+        for (let i = 0; i < 30; i++) {
+          floats.push(dv.getFloat32(4 + i * 4, true));
+        }
+        const headPos = floats.slice(0, 3);
+        const headFwd = floats.slice(3, 6);
+        const leftPalmPos = floats.slice(6, 9);
+        const leftPalmFwd = floats.slice(9, 12);
+        const leftElbowPos = floats.slice(12, 15);
+        const rightPalmPos = floats.slice(15, 18);
+        const rightPalmFwd = floats.slice(18, 21);
+        const rightElbowPos = floats.slice(21, 24);
+        const swordPos = floats.slice(24, 27);
+        const swordFwd = floats.slice(27, 30);
+
+        const clamp = (v) => Math.max(-1, Math.min(1, v));
+        const processArm = (side) => {
+          const sideSign = side === "left" ? -1 : 1;
+          const shoulderPos = [
+            headPos[0] + sideSign * 0.15,
+            headPos[1] - 0.25,
+            headPos[2] - 0.05,
+          ];
+          const elbowPos = side === "left" ? leftElbowPos : rightElbowPos;
+          const wristPos = side === "left" ? leftPalmPos : rightPalmPos;
+          const vU = [
+            elbowPos[0] - shoulderPos[0],
+            elbowPos[1] - shoulderPos[1],
+            elbowPos[2] - shoulderPos[2],
+          ];
+          const lenU = Math.hypot(vU[0], vU[1], vU[2]);
+          const vL = [
+            wristPos[0] - elbowPos[0],
+            wristPos[1] - elbowPos[1],
+            wristPos[2] - elbowPos[2],
+          ];
+          const lenL = Math.hypot(vL[0], vL[1], vL[2]);
+          if (lenU > 0.01 && lenL > 0.01) {
+            const dot =
+              (vU[0] * vL[0] + vU[1] * vL[1] + vU[2] * vL[2]) / (lenU * lenL);
+            const elbowPitch = Math.acos(clamp(dot));
+            const armPitch = Math.asin(-vU[1] / lenU);
+            const armYaw = Math.atan2(vU[0], -vU[2]);
+            return { armPitch, armYaw, armAbd: 0, elbowPitch };
+          }
+          return { armPitch: 0, armYaw: 0, armAbd: 0, elbowPitch: 0 };
+        };
+
+        const left = processArm("left");
+        const right = processArm("right");
+        const bodyYaw = Math.atan2(headFwd[0], -headFwd[2]);
+        const headPitch = Math.asin(-headFwd[1]);
+
+        return {
+          seq,
+          isStale,
+          headPos,
+          headFwd,
+          leftPalmPos,
+          leftPalmFwd,
+          leftElbowPos,
+          rightPalmPos,
+          rightPalmFwd,
+          rightElbowPos,
+          swordPos,
+          swordFwd,
+          bodyYaw,
+          headPitch,
+          leftArmPitch: left.armPitch,
+          leftArmYaw: left.armYaw,
+          leftArmAbd: left.armAbd,
+          leftElbowPitch: left.elbowPitch,
+          rightArmPitch: right.armPitch,
+          rightArmYaw: right.armYaw,
+          rightArmAbd: right.armAbd,
+          rightElbowPitch: right.elbowPitch,
+        };
+      }
+
+      function packEnemyScenePayload() {
+        const buf = new ArrayBuffer(56);
+        const dv = new DataView(buf);
+        let off = 0;
+        enemySceneSeq = (enemySceneSeq + 1) >>> 0;
+        const nz = (v, d) => (Number.isFinite(v) ? v : d);
+        dv.setUint32(off, enemySceneSeq, true);
+        off += 4;
+        dv.setFloat32(off, nz(sensorState1.lastPos[0], 0), true);
+        off += 4;
+        dv.setFloat32(off, nz(sensorState1.lastPos[1], 0), true);
+        off += 4;
+        dv.setFloat32(off, nz(sensorState1.lastPos[2], 0), true);
+        off += 4;
+        dv.setFloat32(off, nz(sensorState1.lastQuat[0], 0), true);
+        off += 4;
+        dv.setFloat32(off, nz(sensorState1.lastQuat[1], 0), true);
+        off += 4;
+        dv.setFloat32(off, nz(sensorState1.lastQuat[2], 0), true);
+        off += 4;
+        dv.setFloat32(off, nz(sensorState1.lastQuat[3], 1), true);
+        off += 4;
+        dv.setFloat32(off, nz(sensorOri.alpha, 0), true);
+        off += 4;
+        dv.setFloat32(off, nz(sensorOri.beta, 0), true);
+        off += 4;
+        dv.setFloat32(off, nz(sensorOri.gamma, 0), true);
+        off += 4;
+        dv.setFloat32(off, nz(sensorAcc.x, 0), true);
+        off += 4;
+        dv.setFloat32(off, nz(sensorAcc.y, 0), true);
+        off += 4;
+        dv.setFloat32(off, nz(sensorAcc.z, 0), true);
+        return buf;
+      }
+
+      let broadcastStream = null;
+      function ensureBroadcastStream() {
+        if (broadcastStream) return broadcastStream;
+        if (!bcastRenderer.domElement.captureStream) return null;
+        broadcastStream = bcastRenderer.domElement.captureStream(broadcastFPS);
+        return broadcastStream;
+      }
+
+      const sensorLink = createSensorLink({
+        roomId: () =>
+          (roomInputSensor && roomInputSensor.value.trim()) || "imu-data",
+        onPacket: (buf) => applyPosePacket(buf, sensorState1),
+        statusEl: qrStatusSensor,
+        logTag: "sensor1",
+      });
+
+      const enemyLink = createSensorLink({
+        roomId: () =>
+          (roomInputEnemy && roomInputEnemy.value.trim()) || "VP000000",
+        onPacket: (buf) => applyPosePacket(buf, enemyState),
+        statusEl: qrStatusEnemy,
+        logTag: "enemy",
+        onStateChange: (state, pc) => {
+          if (!pc) return;
+          console.log(
+            "[enemy] pc=" +
+              (state.pcState || "none") +
+              " ice=" +
+              (state.iceState || "none") +
+              " dc=" +
+              (state.dcState || "none"),
+          );
+        },
+        onSend: (payload) => {
+          if (payload instanceof ArrayBuffer) {
+            console.log("[enemy] sent bytes", payload.byteLength);
+          } else {
+            console.log("[enemy] sent", payload);
+          }
+        },
+        sendIntervalMs: 33,
+        sendPayload: () => packEnemyScenePayload(),
+        // sendPayload: () => "Hello World",
+      });
+
+      const broadcastLink = createBroadcastLink({
+        roomId: () =>
+          (roomInputView && roomInputView.value.trim()) || "imu-view",
+        getStream: ensureBroadcastStream,
+      });
+
+      function startSensor() {
+        rxCount = 0;
+        rxWindowStart = performance.now();
+        sensorLink.start();
+      }
+      function startEnemy() {
+        enemyLink.start();
+      }
+
+      function stopBroadcast() {
+        broadcastLink.stop();
+        bcastSbsEnabled = false;
+      }
+
+      btnCalibrate.onclick = () => {
+        if (!lastSample) return;
+        zeroPos = {
+          x: lastSample.px,
+          y: lastSample.py,
+          z: lastSample.pz,
+        };
+      };
+      window.addEventListener("load", () => {
+        bcastSbsEnabled = true;
+        startSensor();
+        startEnemy();
+        broadcastLink.start();
+        console.log("[auto] sensor + broadcast start");
+      });
+      window.addEventListener("beforeunload", () => {
+        sensorLink.stop();
+        enemyLink.stop();
+        broadcastLink.stop();
+      });
+
+      if (btnToggleUI && uiEl) {
+        btnToggleUI.onclick = () => {
+          uiEl.classList.toggle("collapsed");
+          btnToggleUI.textContent = uiEl.classList.contains("collapsed")
+            ? "Show QR"
+            : "Hide QR";
+        };
+      }
+      if (btnTogglePose && poseControlsEl) {
+        btnTogglePose.onclick = () => {
+          poseControlsEl.classList.toggle("hidden");
+          btnTogglePose.textContent = poseControlsEl.classList.contains(
+            "hidden",
+          )
+            ? "Show Pose"
+            : "Hide Pose";
+        };
+      }
+      if (btnCaptureRef) {
+        btnCaptureRef.onclick = () => {
+          if (!lastEnemyDecoded) {
+            console.log("[ref] no enemy packet yet");
+            return;
+          }
+          refEnemyPos = {
+            x: lastEnemyDecoded.headPos[0],
+            y: 0,
+            z: -lastEnemyDecoded.headPos[2],
+          };
+          refEnemyYaw = lastEnemyDecoded.bodyYaw;
+          refPose = alignEnemyPose(lastEnemyDecoded);
+          console.log("[ref] captured", { refPose, refEnemyPos });
+        };
+      }
+    </script>
+  </body>
+</html>

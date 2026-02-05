@@ -47,6 +47,18 @@
         padding: 8px;
         border-radius: 8px;
       }
+      #poseControls {
+        position: fixed;
+        right: 12px;
+        top: 12px;
+        width: 280px;
+        max-height: calc(100vh - 24px);
+        overflow: auto;
+        background: rgba(255, 255, 255, 0.92);
+        padding: 10px;
+        border-radius: 10px;
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+      }
       canvas {
         display: block;
       }
@@ -65,6 +77,7 @@
       </div>
 
       <div id="stats">waiting...</div>
+      <div id="poseControls"></div>
     </div>
 
     <script type="importmap">
@@ -82,6 +95,8 @@
       // ---------- Three.js scene ----------
       const renderer = new THREE.WebGLRenderer({ antialias: true });
       renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.domElement.setAttribute("tabindex", "0");
+      renderer.domElement.style.outline = "none";
       document.body.appendChild(renderer.domElement);
 
       const bcastCanvas = document.createElement("canvas");
@@ -101,6 +116,9 @@
         100,
       );
       camera.position.set(0, 1.2, 3);
+      const handGroup = new THREE.Group();
+      handGroup.position.set(0, 0, -0.35);
+      camera.add(handGroup);
       camera.rotation.order = "YXZ";
       const degToRad = Math.PI / 180;
       let sensorOri = { alpha: 0, beta: 0, gamma: 0 };
@@ -115,6 +133,8 @@
       stereo.eyeSep = 0.064;
       let sbsEnabled = false;
       let bcastSbsEnabled = false;
+      const keys = {};
+      const moveSpeed = 0.03;
 
       scene.add(new THREE.HemisphereLight(undefined, undefined, 1.0));
       const dir = new THREE.DirectionalLight(undefined, 1.0);
@@ -125,6 +145,176 @@
       scene.add(grid);
       const axes = new THREE.AxesHelper(1.2);
       scene.add(axes);
+
+      // ---------- Simple skeleton (head/torso/arms/legs) ----------
+      const skeletonRoot = new THREE.Group();
+      scene.add(skeletonRoot);
+
+      const matBody = new THREE.MeshStandardMaterial({ color: 0x6aa6ff });
+      const matHead = new THREE.MeshStandardMaterial({ color: 0xffd4a3 });
+      const matLimb = new THREE.MeshStandardMaterial({ color: 0x9bd18b });
+
+      const torso = new THREE.Mesh(
+        new THREE.BoxGeometry(0.4, 0.6, 0.2),
+        matBody,
+      );
+      torso.position.set(0, 1.2, 0);
+      skeletonRoot.add(torso);
+
+      const headGroup = new THREE.Group();
+      headGroup.position.set(0, 1.6, 0);
+      skeletonRoot.add(headGroup);
+      const head = new THREE.Mesh(
+        new THREE.SphereGeometry(0.18, 16, 12),
+        matHead,
+      );
+      head.position.set(0, 0.18, 0);
+      headGroup.add(head);
+
+      const leftArmGroup = new THREE.Group();
+      leftArmGroup.position.set(-0.3, 1.45, 0);
+      skeletonRoot.add(leftArmGroup);
+      const leftUpperArm = new THREE.Mesh(
+        new THREE.BoxGeometry(0.15, 0.32, 0.15),
+        matLimb,
+      );
+      leftUpperArm.position.set(0, -0.16, 0);
+      leftArmGroup.add(leftUpperArm);
+      const leftElbowGroup = new THREE.Group();
+      leftElbowGroup.position.set(0, -0.32, 0);
+      leftArmGroup.add(leftElbowGroup);
+      const leftForearm = new THREE.Mesh(
+        new THREE.BoxGeometry(0.14, 0.32, 0.14),
+        matLimb,
+      );
+      leftForearm.position.set(0, -0.16, 0);
+      leftElbowGroup.add(leftForearm);
+
+      const rightArmGroup = new THREE.Group();
+      rightArmGroup.position.set(0.3, 1.45, 0);
+      skeletonRoot.add(rightArmGroup);
+      const rightUpperArm = new THREE.Mesh(
+        new THREE.BoxGeometry(0.15, 0.32, 0.15),
+        matLimb,
+      );
+      rightUpperArm.position.set(0, -0.16, 0);
+      rightArmGroup.add(rightUpperArm);
+      const rightElbowGroup = new THREE.Group();
+      rightElbowGroup.position.set(0, -0.32, 0);
+      rightArmGroup.add(rightElbowGroup);
+      const rightForearm = new THREE.Mesh(
+        new THREE.BoxGeometry(0.14, 0.32, 0.14),
+        matLimb,
+      );
+      rightForearm.position.set(0, -0.16, 0);
+      rightElbowGroup.add(rightForearm);
+
+      const leftLegGroup = new THREE.Group();
+      leftLegGroup.position.set(-0.11, 0.9, 0);
+      skeletonRoot.add(leftLegGroup);
+      const leftLeg = new THREE.Mesh(
+        new THREE.BoxGeometry(0.18, 0.6, 0.18),
+        matLimb,
+      );
+      leftLeg.position.set(0, -0.3, 0);
+      leftLegGroup.add(leftLeg);
+
+      const rightLegGroup = new THREE.Group();
+      rightLegGroup.position.set(0.11, 0.9, 0);
+      skeletonRoot.add(rightLegGroup);
+      const rightLeg = new THREE.Mesh(
+        new THREE.BoxGeometry(0.18, 0.6, 0.18),
+        matLimb,
+      );
+      rightLeg.position.set(0, -0.3, 0);
+      rightLegGroup.add(rightLeg);
+
+      function applyPose(pose) {
+        skeletonRoot.rotation.y = pose.bodyYaw || 0;
+        headGroup.rotation.x = pose.headPitch || 0;
+        leftArmGroup.rotation.x = pose.leftArmPitch || 0;
+        leftArmGroup.rotation.y = pose.leftArmYaw || 0;
+        leftArmGroup.rotation.z = pose.leftArmAbd || 0;
+        leftElbowGroup.rotation.x = pose.leftElbowPitch || 0;
+        rightArmGroup.rotation.x = pose.rightArmPitch || 0;
+        rightArmGroup.rotation.y = pose.rightArmYaw || 0;
+        rightArmGroup.rotation.z = pose.rightArmAbd || 0;
+        rightElbowGroup.rotation.x = pose.rightElbowPitch || 0;
+        leftLegGroup.rotation.x = pose.leftLegPitch || 0;
+        rightLegGroup.rotation.x = pose.rightLegPitch || 0;
+      }
+
+      const poseStateDeg = {
+        bodyYaw: 0,
+        headPitch: 0,
+        leftArmPitch: 0,
+        leftArmYaw: 0,
+        leftArmAbd: 0,
+        leftElbowPitch: 0,
+        rightArmPitch: 0,
+        rightArmYaw: 0,
+        rightArmAbd: 0,
+        rightElbowPitch: 0,
+        leftLegPitch: 0,
+        rightLegPitch: 0,
+      };
+
+      function buildPoseControls() {
+        const items = [
+          ["bodyYaw", "Body Yaw", -180, 180],
+          ["headPitch", "Head Pitch", -60, 60],
+          ["leftArmPitch", "Left Arm Pitch", -120, 120],
+          ["leftArmYaw", "Left Arm Yaw", -50, 50],
+          ["leftArmAbd", "Left Arm Abduction", -90, 90],
+          ["leftElbowPitch", "Left Elbow Pitch", 0, 140],
+          ["rightArmPitch", "Right Arm Pitch", -120, 120],
+          ["rightArmYaw", "Right Arm Yaw", -50, 50],
+          ["rightArmAbd", "Right Arm Abduction", -90, 90],
+          ["rightElbowPitch", "Right Elbow Pitch", 0, 140],
+        ];
+        const frag = document.createDocumentFragment();
+        items.forEach(([key, label, min, max]) => {
+          const wrap = document.createElement("div");
+          wrap.style.margin = "6px 0";
+          const title = document.createElement("div");
+          const valueSpan = document.createElement("span");
+          valueSpan.style.marginLeft = "6px";
+          valueSpan.textContent = "0";
+          title.textContent = label + " (" + key + ") ";
+          title.appendChild(valueSpan);
+          title.style.fontSize = "12px";
+          const input = document.createElement("input");
+          input.type = "range";
+          input.min = String(min);
+          input.max = String(max);
+          input.step = "1";
+          input.value = "0";
+          input.style.width = "100%";
+          input.style.margin = "0";
+          input.addEventListener("input", () => {
+            poseStateDeg[key] = Number(input.value);
+            valueSpan.textContent = String(poseStateDeg[key]);
+            applyPose({
+              bodyYaw: (poseStateDeg.bodyYaw * Math.PI) / 180,
+              headPitch: (poseStateDeg.headPitch * Math.PI) / 180,
+              leftArmPitch: (poseStateDeg.leftArmPitch * Math.PI) / 180,
+              leftArmYaw: (poseStateDeg.leftArmYaw * Math.PI) / 180,
+              leftArmAbd: (poseStateDeg.leftArmAbd * Math.PI) / 180,
+              leftElbowPitch: (poseStateDeg.leftElbowPitch * Math.PI) / 180,
+              rightArmPitch: (poseStateDeg.rightArmPitch * Math.PI) / 180,
+              rightArmYaw: (poseStateDeg.rightArmYaw * Math.PI) / 180,
+              rightArmAbd: (poseStateDeg.rightArmAbd * Math.PI) / 180,
+              rightElbowPitch: (poseStateDeg.rightElbowPitch * Math.PI) / 180,
+              leftLegPitch: (poseStateDeg.leftLegPitch * Math.PI) / 180,
+              rightLegPitch: (poseStateDeg.rightLegPitch * Math.PI) / 180,
+            });
+          });
+          wrap.appendChild(title);
+          wrap.appendChild(input);
+          frag.appendChild(wrap);
+        });
+        poseControlsEl.appendChild(frag);
+      }
 
       // Placeholder cylinder (axis = Y)
       const cyl = new THREE.Mesh(
@@ -141,15 +331,30 @@
         "./lightsaber1.glb",
         (gltf) => {
           const model = gltf.scene;
-          model.position.set(0, 0.6, 0);
-          model.scale.set(1, 1, 1);
-          scene.add(model);
+          model.position.set(0, 0, 0);
+          model.scale.set(2, 2, 2);
+          handGroup.add(model);
           poseObject = model;
           cyl.visible = false;
         },
         undefined,
         (err) => {
           console.error("Failed to load lightsaber model", err);
+        },
+      );
+
+      loader.load(
+        "./lightsaber1.glb",
+        (gltf) => {
+          const saber = gltf.scene;
+          saber.scale.set(1, 1, 1);
+          saber.position.set(0, -0.3, 0);
+          saber.rotation.y = Math.PI;
+          rightElbowGroup.add(saber);
+        },
+        undefined,
+        (err) => {
+          console.error("Failed to load fixed lightsaber model", err);
         },
       );
 
@@ -181,6 +386,14 @@
       }
 
       function animate() {
+        if (keys["w"]) skeletonRoot.position.z -= moveSpeed;
+        if (keys["s"]) skeletonRoot.position.z += moveSpeed;
+        if (keys["a"]) skeletonRoot.position.x -= moveSpeed;
+        if (keys["d"]) skeletonRoot.position.x += moveSpeed;
+        const t = performance.now() * 0.008;
+        const legAmp = (40 * Math.PI) / 180;
+        leftLegGroup.rotation.x = Math.sin(t) * legAmp;
+        rightLegGroup.rotation.x = Math.sin(t + Math.PI) * legAmp;
         if (sensorHasOri) {
           const beta = sensorOri.beta * degToRad;
           const alpha = sensorOri.alpha * degToRad;
@@ -213,12 +426,27 @@
       }
       animate();
 
+      function keyDown(e) {
+        keys[e.key.toLowerCase()] = true;
+      }
+      function keyUp(e) {
+        keys[e.key.toLowerCase()] = false;
+      }
+      window.addEventListener("keydown", keyDown);
+      window.addEventListener("keyup", keyUp);
+      document.addEventListener("keydown", keyDown);
+      document.addEventListener("keyup", keyUp);
+      window.addEventListener("click", () => {
+        renderer.domElement.focus();
+      });
+
       // ---------- WebRTC / UI ----------
       const offerOut = null;
       const answerIn = null;
       const iceOut = null;
       const iceIn = null;
       const statsEl = document.getElementById("stats");
+      const poseControlsEl = document.getElementById("poseControls");
       const roomInputSensor = document.getElementById("roomIdSensor");
       const roomInputView = document.getElementById("roomIdView");
       const btnCalibrate = document.getElementById("btnCalibrate");
@@ -230,6 +458,8 @@
       const clientId =
         (crypto && crypto.randomUUID && crypto.randomUUID()) ||
         Math.random().toString(36).slice(2);
+
+      buildPoseControls();
 
       // ---------- AR pose packet parsing (40 bytes) ----------
       // Layout:
@@ -248,6 +478,7 @@
       const modelCorrection = new THREE.Quaternion().setFromEuler(
         new THREE.Euler(0, -Math.PI / 2, 0),
       );
+      const useCameraHand = true;
       let zeroPos = { x: 0, y: 0, z: 0 };
       let lastSample = null;
 
@@ -823,13 +1054,15 @@
         const qw = p.qw;
         lastSample = { px, py, pz, qx, qy, qz, qw };
 
-        poseObject.position.set(
-          basePos.x + (px - zeroPos.x) * posScale,
-          basePos.y + (py - zeroPos.y) * posScale,
-          basePos.z + (pz - zeroPos.z) * posScale,
-        );
-        const deviceQuat = new THREE.Quaternion(qx, qy, qz, qw);
-        poseObject.quaternion.copy(deviceQuat).multiply(modelCorrection);
+        if (!useCameraHand && poseObject) {
+          poseObject.position.set(
+            basePos.x + (px - zeroPos.x) * posScale,
+            basePos.y + (py - zeroPos.y) * posScale,
+            basePos.z + (pz - zeroPos.z) * posScale,
+          );
+          const deviceQuat = new THREE.Quaternion(qx, qy, qz, qw);
+          poseObject.quaternion.copy(deviceQuat).multiply(modelCorrection);
+        }
       }
 
       let broadcastStream = null;
