@@ -1,0 +1,15 @@
+platform :ios, '26.0'
+
+target 'IMUSender' do
+  use_frameworks!
+  pod 'GoogleWebRTC'
+end
+
+post_install do |installer|
+  # Pods 타겟 전부에서 User Script Sandboxing 끄기
+  installer.pods_project.targets.each do |t|
+    t.build_configurations.each do |config|
+      config.build_settings['ENABLE_USER_SCRIPT_SANDBOXING'] = 'NO'
+    end
+  end
+end

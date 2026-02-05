@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>Controller</string>
+	<key>NSCameraUsageDescription</key>
+	<string>AR pose tracking needs camera access.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_madcamp._udp</string>
+		<string>_madcamp._tcp</string>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Used to discover and stream data to Vision Pro.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>3.37.140.87</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+		</dict>
+	</dict>
+</dict>
+</plist>
